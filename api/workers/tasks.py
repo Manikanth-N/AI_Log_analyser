@@ -10,11 +10,23 @@ from .celery_app import celery_app
 log = structlog.get_logger(__name__)
 
 
-@celery_app.task(bind=True, max_retries=0, time_limit=3600, name="api.workers.tasks.parse_log_task")
+# ── Parse task ────────────────────────────────────────────────────────────────
+
+@celery_app.task(
+    bind=True,
+    name="api.workers.tasks.parse_log_task",
+    max_retries=2,
+    default_retry_delay=30,
+    # Hard limits set in celery_app.conf (task_soft_time_limit / task_time_limit)
+)
 def parse_log_task(self, flight_id: str, file_path: str):
     """
     Parse a raw log file and write Parquet + derived data.
     Runs on the 'parse' queue with 2 concurrent workers.
+
+    Retries:
+      - Transient failures (OOM, file lock): retry up to 2× with 30s delay.
+      - Permanent failures (corrupt file, unknown format): no retry — mark error.
     """
     from config.settings import settings
     from pipeline.ingestion import IngestionPipeline
@@ -39,7 +51,6 @@ def parse_log_task(self, flight_id: str, file_path: str):
         )
         result = pipeline.run()
 
-        # Update flight record with metadata
         db.update_flight_status(
             flight_id,
             "ready",
@@ -52,17 +63,41 @@ def parse_log_task(self, flight_id: str, file_path: str):
         log.info("parse_complete", flight_id=flight_id, rows=result.rows_parsed)
         return {"flight_id": flight_id, "rows": result.rows_parsed, "status": "ready"}
 
-    except Exception as e:
-        log.error("parse_error", flight_id=flight_id, error=str(e))
+    except (MemoryError, OSError) as exc:
+        # Transient — retry
+        log.warning("parse_transient_error", flight_id=flight_id, error=str(exc),
+                    retries=self.request.retries)
+        raise self.retry(exc=exc)
+
+    except Exception as exc:
+        # Permanent — mark error, route to DLQ
+        log.error("parse_permanent_error", flight_id=flight_id, error=str(exc))
         db.update_flight_status(flight_id, "error")
+        _send_to_dlq("parse.dlq", {
+            "task": "parse_log_task",
+            "flight_id": flight_id,
+            "file_path": file_path,
+            "error": str(exc),
+        })
         raise
 
 
-@celery_app.task(bind=True, max_retries=0, time_limit=7200, name="api.workers.tasks.run_investigation_task")
+# ── Investigation task ────────────────────────────────────────────────────────
+
+@celery_app.task(
+    bind=True,
+    name="api.workers.tasks.run_investigation_task",
+    max_retries=1,               # retry once — LLM transient failures are common
+    default_retry_delay=60,
+)
 def run_investigation_task(self, investigation_id: str, flight_id: str, query: str):
     """
     Run complete multi-agent investigation.
-    Runs on the 'investigate' queue with 1 concurrent worker (GPU constraint).
+    Runs on the 'investigate' queue with 1 concurrent worker.
+
+    Retries:
+      - Provider timeout / 429 / 5xx: retry once after 60s.
+      - Permanent failures (invalid state, missing data): DLQ.
     """
     import redis
     from config.settings import settings
@@ -70,11 +105,12 @@ def run_investigation_task(self, investigation_id: str, flight_id: str, query: s
     from storage.metadata_db import MetadataDB
 
     db = MetadataDB()
-
     redis_client = redis.Redis.from_url(settings.redis_pubsub_url)
 
     try:
         db.update_investigation(investigation_id, status="running")
+        self.update_state(state="PROGRESS", meta={"investigation_id": investigation_id,
+                                                   "stage": "running"})
 
         orchestrator = InvestigationOrchestrator(
             flight_id=flight_id,
@@ -87,7 +123,6 @@ def run_investigation_task(self, investigation_id: str, flight_id: str, query: s
             max_iterations=3,
         )
 
-        # Persist anomalies to DB
         anomalies = final_state.get("anomalies", [])
         if anomalies:
             db.save_anomalies(flight_id, anomalies)
@@ -105,19 +140,70 @@ def run_investigation_task(self, investigation_id: str, flight_id: str, query: s
             open_questions=final_state.get("open_questions", []),
         )
 
-        # Signal completion
         redis_client.publish(
             f"inv:{investigation_id}",
             '{"type": "complete", "data": {"status": "complete"}}',
         )
 
+        log.info("investigation_complete", investigation_id=investigation_id,
+                 classification=final_state.get("classification", "?"))
         return {"investigation_id": investigation_id, "status": "complete"}
 
-    except Exception as e:
-        log.error("investigation_error", investigation_id=investigation_id, error=str(e))
+    except Exception as exc:
+        error_str = str(exc)
+        is_transient = _is_transient_error(exc)
+
+        if is_transient and self.request.retries < self.max_retries:
+            log.warning(
+                "investigation_transient_error",
+                investigation_id=investigation_id,
+                error=error_str,
+                retries=self.request.retries,
+            )
+            db.update_investigation(investigation_id, status="retrying")
+            raise self.retry(exc=exc)
+
+        # Permanent failure
+        log.error("investigation_failed", investigation_id=investigation_id, error=error_str)
         db.update_investigation(investigation_id, status="error")
-        redis_client.publish(
-            f"inv:{investigation_id}",
-            f'{{"type": "error", "data": {{"error": "{str(e)}"}}}}',
-        )
+        _send_to_dlq("investigate.dlq", {
+            "task": "run_investigation_task",
+            "investigation_id": investigation_id,
+            "flight_id": flight_id,
+            "query": query,
+            "error": error_str,
+        })
+        try:
+            redis_client.publish(
+                f"inv:{investigation_id}",
+                f'{{"type": "error", "data": {{"error": "{error_str[:200]}"}}}}',
+            )
+        except Exception:
+            pass
         raise
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _is_transient_error(exc: Exception) -> bool:
+    """
+    Classify an exception as transient (retry-able) or permanent.
+    LLM provider errors (rate limit, timeout, 5xx) are transient.
+    """
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "timeout", "rate limit", "429", "503", "502", "connection", "temporarily"
+    ))
+
+
+def _send_to_dlq(queue: str, payload: dict) -> None:
+    """Send a failed task payload to the dead-letter queue for manual inspection."""
+    try:
+        import json
+        import redis
+        from config.settings import settings
+        r = redis.Redis.from_url(settings.redis_url)
+        r.rpush(f"celery.{queue}", json.dumps(payload))
+        log.info("task_sent_to_dlq", queue=queue, task=payload.get("task"))
+    except Exception as e:
+        log.error("dlq_write_failed", error=str(e))

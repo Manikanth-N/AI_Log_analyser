@@ -1,0 +1,174 @@
+# Production-parity docker-compose.
+# Use for staging / final local validation before AWS deploy.
+# All secrets come from a .env.prod file (never commit it).
+#
+# Usage:
+#   cp .env.example .env.prod && vim .env.prod
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+version: "3.9"
+
+x-api-env: &api-env
+  DATABASE_URL: ${DATABASE_URL}
+  DATABASE_URL_SYNC: ${DATABASE_URL_SYNC}
+  REDIS_URL: ${REDIS_URL}
+  REDIS_RESULT_URL: ${REDIS_RESULT_URL}
+  REDIS_PUBSUB_URL: ${REDIS_PUBSUB_URL}
+  QDRANT_URL: http://qdrant:6333
+  STORAGE_ROOT: /data
+  INFERENCE_MODE: ${INFERENCE_MODE:-api}
+  DOMAIN_PROVIDER: ${DOMAIN_PROVIDER:-openai}
+  DOMAIN_MODEL: ${DOMAIN_MODEL:-gpt-4o-mini-2024-07-18}
+  CRITICAL_PROVIDER: ${CRITICAL_PROVIDER:-anthropic}
+  CRITICAL_MODEL: ${CRITICAL_MODEL:-claude-sonnet-4-6}
+  FALLBACK_PROVIDER: ${FALLBACK_PROVIDER:-openai}
+  FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-4o-2024-11-20}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  INFERENCE_REQUEST_TIMEOUT_SECONDS: ${INFERENCE_REQUEST_TIMEOUT_SECONDS:-120}
+  CORS_ORIGINS: ${CORS_ORIGINS}
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: forensic
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: forensic_flight
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forensic"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [backend]
+
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks: [backend]
+
+  # ── Application ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      <<: *api-env
+      DATABASE_URL: postgresql+asyncpg://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      DATABASE_URL_SYNC: postgresql+psycopg2://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_RESULT_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      REDIS_PUBSUB_URL: redis://:${REDIS_PASSWORD}@redis:6379/2
+    volumes:
+      - flight_data:/data
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [backend, frontend-net]
+    ports:
+      - "8000:8000"
+
+  worker-parse:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - api.workers.celery_app
+      - worker
+      - --concurrency=2
+      - -Q
+      - parse
+      - --loglevel=info
+      - --without-gossip
+      - --without-mingle
+    environment:
+      <<: *api-env
+      DATABASE_URL: postgresql+asyncpg://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      DATABASE_URL_SYNC: postgresql+psycopg2://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_RESULT_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      REDIS_PUBSUB_URL: redis://:${REDIS_PASSWORD}@redis:6379/2
+    volumes:
+      - flight_data:/data
+    depends_on:
+      - redis
+      - postgres
+    networks: [backend]
+
+  worker-investigate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - api.workers.celery_app
+      - worker
+      - --concurrency=1
+      - -Q
+      - investigate
+      - --loglevel=info
+      - --without-gossip
+      - --without-mingle
+    environment:
+      <<: *api-env
+      DATABASE_URL: postgresql+asyncpg://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      DATABASE_URL_SYNC: postgresql+psycopg2://forensic:${DB_PASSWORD}@postgres:5432/forensic_flight
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_RESULT_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      REDIS_PUBSUB_URL: redis://:${REDIS_PASSWORD}@redis:6379/2
+    volumes:
+      - flight_data:/data
+    depends_on:
+      - redis
+      - postgres
+    networks: [backend]
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks: [frontend-net]
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  flight_data:
+
+networks:
+  backend:
+    driver: bridge
+  frontend-net:
+    driver: bridge

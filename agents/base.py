@@ -10,8 +10,16 @@ from typing import Any, Literal
 
 import structlog
 
-from llm.client import OllamaClient, get_llm_client
+from llm.client import get_llm_client
+from llm.inference_client import InferenceClient
 from storage.parquet_store import ParquetStore
+
+# Backward-compat: OllamaClient kept importable from agents.base for tests
+# that do `from agents.base import ...`.  Remove once all tests migrate.
+try:
+    from llm.client import OllamaClient
+except ImportError:
+    OllamaClient = None  # type: ignore[assignment,misc]
 
 HypothesisStatus = Literal["forming", "supported", "refuted", "confirmed"]
 
@@ -56,12 +64,12 @@ class BaseAgent(ABC):
         flight_id: str,
         investigation_id: str,
         store: ParquetStore | None = None,
-        llm: OllamaClient | None = None,
+        llm: "InferenceClient | OllamaClient | None" = None,
     ):
         self.flight_id = flight_id
         self.investigation_id = investigation_id
         self.store = store or ParquetStore()
-        self.llm = llm or get_llm_client()
+        self.llm: InferenceClient = llm or get_llm_client()  # type: ignore[assignment]
         self.log = structlog.get_logger(self.AGENT_NAME)
 
     @abstractmethod

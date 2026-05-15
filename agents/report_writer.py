@@ -12,6 +12,7 @@ Evidence integrity contract:
 import json
 from datetime import datetime
 
+from intelligence.narrative_validator import apply_narrative_safety_gate
 from llm.prompts.system_prompts import REPORT_WRITER_PROMPT
 from llm.structured import ForensicReportLLM
 from .base import BaseAgent
@@ -106,6 +107,20 @@ class ReportWriterAgent(BaseAgent):
             report_data["root_cause_determination"] = crash_findings["proximate_cause"]
         if crash_findings.get("confidence_label"):
             report_data["confidence_level"] = crash_findings["confidence_label"]
+
+        # Phase 5C: narrative safety gate — validate free-text fields against evidence domains
+        report_data = apply_narrative_safety_gate(
+            report_data=report_data,
+            anomalies=anomalies,
+            agent_findings=agent_findings,
+        )
+        if not report_data.get("_narrative_validation", {}).get("valid", True):
+            self.emit(
+                state,
+                "Narrative safety gate triggered: cross-domain hallucination detected and "
+                "replaced with structured-first fallback. See _narrative_validation in report.",
+                level="warning",
+            )
 
         report_path = self.store.write_derived(
             self.flight_id,

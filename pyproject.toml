@@ -20,7 +20,8 @@ dependencies = [
     "ruptures>=1.1.9",
     # LLM
     "openai>=1.10.0",
-    "instructor>=0.5.0",
+    "anthropic>=0.40.0",
+    "instructor>=1.0.0",
     "langchain>=0.1.0",
     "langgraph>=0.0.40",
     # Storage

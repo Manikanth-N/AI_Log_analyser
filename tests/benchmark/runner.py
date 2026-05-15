@@ -71,17 +71,29 @@ class BenchmarkRunner:
     """
     Runs an investigation for a BenchmarkCase and returns a BenchmarkResult.
 
-    mode="stub"  — patches LLM with StubOllamaClient (fast, no Ollama needed)
-    mode="live"  — uses real Ollama (slow, full diagnostic accuracy test)
+    mode="stub"  — patches LLM with StubInferenceClient (fast, no server needed)
+    mode="live"  — uses real inference (Ollama, cloud API, or hybrid)
+
+    inference_overrides: optional dict of settings overrides for live mode, e.g.
+        {
+            "inference_mode": "api",
+            "critical_provider": "anthropic",
+            "critical_model": "claude-sonnet-4-6",
+            "domain_provider": "openai",
+            "domain_model": "gpt-4o-mini-2024-07-18",
+        }
+    These are applied on top of the current settings for the duration of the run.
     """
 
     def __init__(
         self,
         mode: Literal["stub", "live"] = "stub",
         logs_dir: Path | None = None,
+        inference_overrides: dict | None = None,
     ):
         self.mode = mode
         self.logs_dir = logs_dir or Path(__file__).parent.parent.parent / "logs"
+        self.inference_overrides = inference_overrides or {}
 
     def run(self, case: BenchmarkCase) -> BenchmarkResult:
         from config.settings import settings
@@ -134,7 +146,8 @@ class BenchmarkRunner:
                 )
             else:
                 report_data, inv_errors = self._run_live(
-                    flight_id, investigation_id, store
+                    flight_id, investigation_id, store,
+                    inference_overrides=self.inference_overrides,
                 )
             errors.extend(inv_errors)
         except Exception as e:
@@ -209,23 +222,48 @@ class BenchmarkRunner:
             final_state = orch.run(max_iterations=1)
         return final_state.get("final_report", {}), final_state.get("errors", [])
 
-    def _run_live(self, flight_id, investigation_id, store):
+    def _run_live(self, flight_id, investigation_id, store, inference_overrides=None):
+        """
+        Run a live investigation.
+
+        inference_overrides patches settings fields for the duration of this call,
+        allowing the benchmark to target a specific inference configuration without
+        changing the process-level .env file.  A new InferenceClient singleton is
+        forced so provider construction picks up the patched settings.
+        """
+        from unittest.mock import patch
         from api.workers.tasks import run_investigation_task
-
-        result = run_investigation_task.apply(args=[
-            investigation_id, flight_id,
-            "Benchmark forensic investigation",
-        ])
-        if result.failed():
-            return {}, [f"Investigation task failed: {result.traceback[:200]}"]
-
         from config.settings import settings
-        report_path = (
-            settings.flights_storage / flight_id / "derived"
-            / f"report_{investigation_id}.json"
-        )
-        report = json.loads(report_path.read_text()) if report_path.exists() else {}
-        return report, []
+
+        overrides = inference_overrides or {}
+        patches = {f"config.settings.settings.{k}": v for k, v in overrides.items()}
+
+        # Force a fresh InferenceClient so overrides take effect
+        import llm.client as _llm_client
+
+        def _run():
+            result = run_investigation_task.apply(args=[
+                investigation_id, flight_id,
+                "Benchmark forensic investigation",
+            ])
+            if result.failed():
+                return {}, [f"Investigation task failed: {result.traceback[:200]}"]
+            report_path = (
+                settings.flights_storage / flight_id / "derived"
+                / f"report_{investigation_id}.json"
+            )
+            report = json.loads(report_path.read_text()) if report_path.exists() else {}
+            return report, []
+
+        if overrides:
+            with patch.multiple("config.settings.settings", **overrides):
+                _llm_client._client = None   # force new client with patched settings
+                try:
+                    return _run()
+                finally:
+                    _llm_client._client = None  # reset so next call re-builds cleanly
+        else:
+            return _run()
 
     def _score(
         self,

@@ -1,0 +1,260 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: prod
+        type: choice
+        options: [prod]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a running deploy
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  # ── 1. Run CI gate before deploying ────────────────────────────────────────
+  ci-gate:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
+  # ── 2. Build & push Docker images to ECR ───────────────────────────────────
+  build-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    needs: ci-gate
+
+    outputs:
+      api_image:    ${{ steps.meta.outputs.api_image }}
+      worker_image: ${{ steps.meta.outputs.worker_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URIs
+        id: meta
+        run: |
+          echo "api_image=${{ secrets.ECR_API_REPO }}:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+          echo "worker_image=${{ secrets.ECR_WORKER_REPO }}:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.api_image }}
+            ${{ secrets.ECR_API_REPO }}:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+          provenance: false
+
+      - name: Build & push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.worker
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.worker_image }}
+            ${{ secrets.ECR_WORKER_REPO }}:latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+          provenance: false
+
+  # ── 3. Build & deploy frontend to S3 + CloudFront ──────────────────────────
+  deploy-frontend:
+    name: Deploy frontend
+    runs-on: ubuntu-latest
+    needs: ci-gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefix frontend
+
+      - name: Build frontend
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+        run: npm run build --prefix frontend
+
+      - name: Sync to S3 (hashed assets — long TTL, immutable)
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ secrets.FRONTEND_BUCKET }}/ \
+            --exclude "index.html" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+
+      - name: Sync index.html (short TTL, no cache)
+        run: |
+          aws s3 cp frontend/dist/index.html s3://${{ secrets.FRONTEND_BUCKET }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+  # ── 4. Update ECS services ──────────────────────────────────────────────────
+  deploy-backend:
+    name: Deploy backend
+    runs-on: ubuntu-latest
+    needs: build-push
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy API service
+        run: |
+          # Get current task definition, update image, register new revision
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition forensic-flight-prod-api \
+            --query 'taskDefinition' --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | python3 -c "
+          import json, sys
+          td = json.load(sys.stdin)
+          for c in td['containerDefinitions']:
+              if c['name'] == 'api':
+                  c['image'] = '${{ needs.build-push.outputs.api_image }}'
+          # Strip read-only fields before registering
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes',
+                    'compatibilities','registeredAt','registeredBy']:
+              td.pop(k, None)
+          print(json.dumps(td))
+          ")
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service forensic-flight-prod-api \
+            --task-definition "$NEW_ARN" \
+            --force-new-deployment
+
+      - name: Deploy worker-parse service
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition forensic-flight-prod-worker-parse \
+            --query 'taskDefinition' --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | python3 -c "
+          import json, sys
+          td = json.load(sys.stdin)
+          for c in td['containerDefinitions']:
+              if c['name'] == 'worker-parse':
+                  c['image'] = '${{ needs.build-push.outputs.worker_image }}'
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes',
+                    'compatibilities','registeredAt','registeredBy']:
+              td.pop(k, None)
+          print(json.dumps(td))
+          ")
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service forensic-flight-prod-worker-parse \
+            --task-definition "$NEW_ARN" \
+            --force-new-deployment
+
+      - name: Deploy worker-investigate service
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition forensic-flight-prod-worker-investigate \
+            --query 'taskDefinition' --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | python3 -c "
+          import json, sys
+          td = json.load(sys.stdin)
+          for c in td['containerDefinitions']:
+              if c['name'] == 'worker-investigate':
+                  c['image'] = '${{ needs.build-push.outputs.worker_image }}'
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes',
+                    'compatibilities','registeredAt','registeredBy']:
+              td.pop(k, None)
+          print(json.dumps(td))
+          ")
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service forensic-flight-prod-worker-investigate \
+            --task-definition "$NEW_ARN" \
+            --force-new-deployment
+
+      - name: Wait for API service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services forensic-flight-prod-api
+          echo "API service is stable"
+
+      - name: Smoke test
+        run: |
+          ALB_DNS="${{ secrets.ALB_DNS_NAME }}"
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${ALB_DNS}/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed (status $STATUS)"
+              exit 0
+            fi
+            echo "Health check attempt $i: status $STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1

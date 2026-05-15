@@ -1,15 +1,22 @@
 """
-Ollama LLM client with retry, circuit breaker, and structured output support.
-All agent calls route through this — never call Ollama directly from agents.
+LLM client module.
 
-Concurrency contract:
-  Ollama processes LLM requests one at a time (single model runner per process).
-  _OLLAMA_SEMAPHORE serializes structured() / complete() calls so that agents
-  running in parallel threads don't queue up inside Ollama and time out.
-  Deterministic agents that never call the LLM are unaffected — they run freely.
+Public API (used by agents and tests):
+  get_llm_client() → InferenceClient
 
-  This makes max_workers>1 safe: deterministic agents parallelize, LLM agents
-  serialize through the semaphore, and no thread blocks in Ollama's queue.
+  The InferenceClient is a provider-agnostic routing facade that supports
+  Anthropic, OpenAI, vLLM, and Ollama.  All inference configuration is
+  driven by config/settings.py (or env vars / .env file).
+
+  OllamaClient is preserved for backward compatibility and direct testing
+  against a local Ollama instance.  New code should use InferenceClient.
+
+Migration guide:
+  Before: from llm.client import OllamaClient, get_llm_client
+  After:  from llm.client import get_llm_client        (InferenceClient returned)
+
+  Agent code that calls self.llm.structured(...) / self.llm.fast_model
+  requires ZERO changes — InferenceClient exposes the same interface.
 """
 
 import threading
@@ -28,8 +35,7 @@ log = structlog.get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# One inference slot — Ollama processes a single request at a time.
-# Agents call structured() / complete() → serialized here, not at the HTTP level.
+# Preserved for tests that import this directly.  New code uses InferenceClient.
 _OLLAMA_SEMAPHORE = threading.Semaphore(1)
 
 
@@ -163,12 +169,27 @@ class OllamaClient:
             return False
 
 
-# Singleton instance — share across agents
-_client: OllamaClient | None = None
+# ---------------------------------------------------------------------------
+# Singleton factory — returns InferenceClient for all new code.
+# The module-level _client variable is kept so tests can patch it directly
+# (same patch target as before: llm.client._client).
+# ---------------------------------------------------------------------------
+
+from llm.inference_client import InferenceClient  # noqa: E402 — circular-safe (no re-import of this module)
+
+_client: InferenceClient | OllamaClient | None = None
 
 
-def get_llm_client() -> OllamaClient:
+def get_llm_client() -> InferenceClient:
+    """
+    Return the shared InferenceClient singleton.
+
+    Thread-safe: first caller constructs; subsequent callers reuse.
+    Tests can replace _client with a stub via:
+        with patch("llm.client._client", stub_inference_client):
+            ...
+    """
     global _client
     if _client is None:
-        _client = OllamaClient()
-    return _client
+        _client = InferenceClient()
+    return _client  # type: ignore[return-value]

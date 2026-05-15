@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm.client import OllamaClient
+from llm.inference_client import InferenceClient
 from llm.structured import (
     ContributingFactor,
     CorrectiveAction,
@@ -217,8 +217,13 @@ _CANNED: dict[str, object] = {
 
 # ── stub client ───────────────────────────────────────────────────────────────
 
-def _make_stub_client() -> OllamaClient:
-    stub = MagicMock(spec=OllamaClient)
+def _make_stub_client() -> InferenceClient:
+    """
+    Return a MagicMock that satisfies the InferenceClient interface.
+
+    Patch target: llm.client._client  (same as before — nothing in agents changes)
+    """
+    stub = MagicMock(spec=InferenceClient)
     stub.primary_model = "stub-model"
     stub.fast_model = "stub-model"
     stub.embedding_model = "stub-embed"
@@ -226,13 +231,15 @@ def _make_stub_client() -> OllamaClient:
     def _structured(*args, response_model=None, **kwargs):
         key = response_model.__name__ if response_model else ""
         if key not in _CANNED:
-            raise ValueError(f"StubOllamaClient: no canned response for {key!r}")
+            raise ValueError(f"StubInferenceClient: no canned response for {key!r}")
         return _CANNED[key]
 
     stub.structured.side_effect = _structured
     stub.fast_structured.side_effect = _structured
     stub.complete.return_value = "Stub completion: investigation summary."
     stub.embed.return_value = [0.0] * 768
+    stub.embed_batch.return_value = [[0.0] * 768]
+    stub.get_usage_summary.return_value = []
 
     return stub
 
@@ -242,10 +249,10 @@ def _make_stub_client() -> OllamaClient:
 @pytest.fixture()
 def stub_llm():
     """
-    Patch llm.client._client with a StubOllamaClient.
+    Patch llm.client._client with a stub InferenceClient.
 
     All agents that call get_llm_client() receive the stub, making the full
-    orchestrator/agent/storage pipeline run in <30 s without Ollama.
+    orchestrator/agent/storage pipeline run in <30 s without any LLM server.
     """
     stub = _make_stub_client()
     with patch("llm.client._client", stub):

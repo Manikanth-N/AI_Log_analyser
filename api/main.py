@@ -2,17 +2,20 @@
 
 import hashlib
 import json
+import time
 import uuid
 from pathlib import Path
 
 import aiofiles
 import redis.asyncio as aioredis
 import structlog
-from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from api.middleware.auth import require_api_key, check_investigation_quota, check_upload_quota
+from api.middleware.upload_validation import validate_upload
 from config.settings import settings
 from storage.metadata_db import MetadataDB, create_tables
 from storage.parquet_store import ParquetStore
@@ -22,15 +25,18 @@ log = structlog.get_logger(__name__)
 app = FastAPI(
     title="Forensic Flight AI",
     version="1.0.0",
-    description="Local autonomous UAV flight log forensic investigator",
+    description="Autonomous UAV flight log forensic investigator",
+    # Disable docs in production via env var to reduce attack surface
+    docs_url="/docs" if getattr(settings, "enable_docs", True) else None,
+    redoc_url=None,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
 
 db = MetadataDB()
@@ -55,18 +61,24 @@ async def startup():
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/flights/upload")
-async def upload_flight(file: UploadFile = File(...)):
+async def upload_flight(
+    file: UploadFile = File(...),
+    api_key: str = Depends(require_api_key),
+):
     """
     Upload a UAV log file. Triggers background parsing.
     Supports .BIN, .ULOG, .TLOG, .CSV, .JSON up to 6GB.
+    Requires X-API-Key header.
     """
-    if file.size and file.size > settings.max_upload_size_bytes:
-        raise HTTPException(413, "File too large")
+    check_upload_quota(api_key)
+
+    # Validate extension, filename safety, magic bytes, and size
+    safe_name = await validate_upload(file, max_bytes=settings.max_upload_size_bytes)
 
     flight_id = str(uuid.uuid4())
     upload_dir = settings.raw_storage / flight_id
     upload_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = upload_dir / (file.filename or "log.bin")
+    dest_path = upload_dir / safe_name
 
     # Stream write to disk (handles large files)
     sha256 = hashlib.sha256()
@@ -91,7 +103,7 @@ async def upload_flight(file: UploadFile = File(...)):
     flight = db.create_flight(
         id=uuid.UUID(flight_id),
         sha256=file_hash,
-        filename=file.filename or "log.bin",
+        filename=safe_name,
         file_size=file_size,
         raw_path=str(dest_path),
         status="uploaded",
@@ -104,8 +116,8 @@ async def upload_flight(file: UploadFile = File(...)):
         queue="parse",
     )
 
-    log.info("upload_complete", flight_id=flight_id, size=file_size)
-    return {"flight_id": flight_id, "status": "parsing", "filename": file.filename}
+    log.info("upload_complete", flight_id=flight_id, size=file_size, filename=safe_name)
+    return {"flight_id": flight_id, "status": "parsing", "filename": safe_name}
 
 
 @app.get("/api/v1/flights/{flight_id}")
@@ -206,12 +218,14 @@ def get_telemetry_series(
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/investigations")
-def start_investigation(body: dict):
+def start_investigation(body: dict, api_key: str = Depends(require_api_key)):
     flight_id = body.get("flight_id")
     query = body.get("query", "Perform complete forensic investigation of this flight log")
 
     if not flight_id:
         raise HTTPException(400, "flight_id required")
+
+    check_investigation_quota(api_key)
 
     flight = db.get_flight(flight_id)
     if not flight:
@@ -349,12 +363,49 @@ def get_report(investigation_id: str, format: str = "json"):
 # HEALTH
 # ─────────────────────────────────────────────────────────────
 
+@app.get("/health")
+def health_simple():
+    """ALB health check — returns 200 if the process is alive."""
+    return {"status": "ok"}
+
+
 @app.get("/api/v1/health")
-def health():
-    from llm.client import get_llm_client
-    llm_ok = get_llm_client().check_health()
+def health_detailed():
+    """
+    Detailed health — checks DB, Redis, and inference provider reachability.
+    Used by monitoring dashboards and manual ops verification.
+    Do NOT use this as the ALB health check (it's slow and might temporarily return degraded).
+    """
+    import redis as _redis
+    checks: dict[str, str] = {}
+
+    # Database
+    try:
+        db.get_flight("health-probe-nonexistent")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # Redis
+    try:
+        r = _redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2)
+        r.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {e}"
+
+    # Inference
+    try:
+        from llm.client import get_llm_client
+        llm_ok = get_llm_client().check_health()
+        checks["inference"] = "ok" if llm_ok else "degraded"
+    except Exception as e:
+        checks["inference"] = f"error: {e}"
+
+    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {
-        "status": "ok",
-        "ollama": "ok" if llm_ok else "degraded",
+        "status": overall,
+        "checks": checks,
+        "inference_mode": settings.inference_mode,
         "version": "1.0.0",
     }

@@ -1,7 +1,7 @@
 """
 Benchmark test suite — Phase 4A diagnostic accuracy gate.
 
-Runs each active BenchmarkCase in stub mode (StubOllamaClient, no Ollama needed)
+Runs each active BenchmarkCase in stub mode (StubInferenceClient, no server needed)
 and asserts all six grounding/accuracy criteria pass.
 
 Stub mode validates:
@@ -11,12 +11,20 @@ Stub mode validates:
   - contributing_factors evidence grounding (no hallucinated rule_names)
   - no forbidden terms in contributing_factors unless backed by evidence
 
-Live mode (--benchmark-live) uses real Ollama; slow (~25-90 min per case).
+Live mode (--benchmark-live) uses real inference — Ollama by default or a cloud API
+when --inference-mode=api is combined with API key environment variables.
 
 Usage:
-  pytest tests/benchmark/test_benchmark.py -v                   # stub mode
-  pytest tests/benchmark/test_benchmark.py --benchmark-live -v  # live mode
-  pytest tests/benchmark/ -v -m benchmark                       # all benchmark tests
+  pytest tests/benchmark/test_benchmark.py -v                         # stub mode
+  pytest tests/benchmark/test_benchmark.py --benchmark-live -v        # live (Ollama)
+  pytest tests/benchmark/test_benchmark.py \\                          # live (cloud API)
+      --benchmark-live \\
+      --inference-mode api \\
+      --critical-provider anthropic \\
+      --critical-model claude-sonnet-4-6 \\
+      --domain-provider openai \\
+      --domain-model gpt-4o-mini-2024-07-18
+  pytest tests/benchmark/ -v -m benchmark                             # all benchmark tests
 """
 
 from __future__ import annotations
@@ -27,15 +35,57 @@ from tests.benchmark.corpus import ACTIVE_CORPUS, BenchmarkCase
 from tests.benchmark.runner import BenchmarkResult, BenchmarkRunner
 
 
-# ── CLI option ────────────────────────────────────────────────────────────────
+# ── CLI options ───────────────────────────────────────────────────────────────
 
 def pytest_addoption(parser):
     parser.addoption(
         "--benchmark-live",
         action="store_true",
         default=False,
-        help="Run benchmarks against real Ollama (slow, full diagnostic accuracy test)",
+        help="Run benchmarks against real inference (Ollama or cloud API).",
     )
+    parser.addoption(
+        "--inference-mode",
+        default=None,
+        choices=["ollama", "api", "hybrid"],
+        help="Override inference_mode for live benchmark runs.",
+    )
+    parser.addoption(
+        "--critical-provider",
+        default=None,
+        help="Override critical_provider (anthropic|openai|vllm|ollama).",
+    )
+    parser.addoption(
+        "--critical-model",
+        default=None,
+        help="Override critical_model (e.g. claude-sonnet-4-6).",
+    )
+    parser.addoption(
+        "--domain-provider",
+        default=None,
+        help="Override domain_provider (openai|anthropic|vllm|ollama).",
+    )
+    parser.addoption(
+        "--domain-model",
+        default=None,
+        help="Override domain_model (e.g. gpt-4o-mini-2024-07-18).",
+    )
+
+
+def _build_inference_overrides(request) -> dict:
+    """Collect CLI inference override options into a settings patch dict."""
+    overrides = {}
+    for cli_key, settings_key in [
+        ("--inference-mode",   "inference_mode"),
+        ("--critical-provider","critical_provider"),
+        ("--critical-model",   "critical_model"),
+        ("--domain-provider",  "domain_provider"),
+        ("--domain-model",     "domain_model"),
+    ]:
+        val = request.config.getoption(cli_key, default=None)
+        if val is not None:
+            overrides[settings_key] = val
+    return overrides
 
 
 # ── Parametrized suite ────────────────────────────────────────────────────────
@@ -51,15 +101,16 @@ def test_benchmark_case(case: BenchmarkCase, request):
     mode = "live" if live else "stub"
 
     if not live and case.case_id != "gps_crash_006":
-        # StubOllamaClient is hard-coded for the gps_crash_006 scenario (GPS failure
+        # StubInferenceClient is hard-coded for the gps_crash_006 scenario (GPS failure
         # → EKF divergence → CRASH/HIGH). All other cases — including other CRASH
-        # types — require real Ollama to validate diagnostic accuracy.
+        # types — require real inference to validate diagnostic accuracy.
         pytest.skip(
             f"Stub is programmed for gps_crash_006 only; "
             f"full gate for {case.case_id!r} requires --benchmark-live"
         )
 
-    runner = BenchmarkRunner(mode=mode)
+    overrides = _build_inference_overrides(request) if live else {}
+    runner = BenchmarkRunner(mode=mode, inference_overrides=overrides)
     result: BenchmarkResult = runner.run(case)
 
     # Print full result on failure for diagnosis
@@ -79,7 +130,8 @@ def test_classification_match(case: BenchmarkCase, request):
     live = request.config.getoption("--benchmark-live", default=False)
     if not live and case.case_id != "gps_crash_006":
         pytest.skip("Stub programmed for gps_crash_006 only; requires --benchmark-live")
-    runner = BenchmarkRunner(mode="stub" if not live else "live")
+    overrides = _build_inference_overrides(request) if live else {}
+    runner = BenchmarkRunner(mode="stub" if not live else "live", inference_overrides=overrides)
     result = runner.run(case)
     criterion = next(
         (c for c in result.criteria if c.name == "classification_match"), None
@@ -128,7 +180,8 @@ def test_no_forbidden_terms(case: BenchmarkCase, request):
     live = request.config.getoption("--benchmark-live", default=False)
     if not live and case.case_id != "gps_crash_006":
         pytest.skip("Stub programmed for gps_crash_006 only; requires --benchmark-live")
-    runner = BenchmarkRunner(mode="stub" if not live else "live")
+    overrides = _build_inference_overrides(request) if live else {}
+    runner = BenchmarkRunner(mode="stub" if not live else "live", inference_overrides=overrides)
     result = runner.run(case)
     criterion = next(
         (c for c in result.criteria if c.name == "no_forbidden_terms"), None

@@ -1,0 +1,43 @@
+# Celery worker image — same base as API, different CMD.
+# parse queue: CPU-bound (pymavlink/pyulog parsing) → 2 vCPU, 4GB in ECS
+# investigate queue: IO-bound (LLM calls) → 1 vCPU, 2GB, concurrency=1
+
+FROM python:3.10-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir "." --prefix=/build/install
+
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r forensic && useradd -r -g forensic -d /app forensic
+
+WORKDIR /app
+
+COPY --from=builder /build/install /usr/local
+COPY --chown=forensic:forensic . .
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV C_FORCE_ROOT=false
+
+USER forensic
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Queue and concurrency are overridden per ECS task definition.
+# Default: investigation worker (single-threaded — one LLM pipeline at a time).
+CMD ["celery", "-A", "api.workers.celery_app", "worker", \
+     "--concurrency=1", "-Q", "investigate", "--loglevel=info", \
+     "--without-gossip", "--without-mingle", "--without-heartbeat"]

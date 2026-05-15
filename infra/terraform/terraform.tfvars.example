@@ -1,0 +1,37 @@
+# Copy to terraform.tfvars and fill in values.
+# Never commit terraform.tfvars — it contains sensitive variable values.
+
+aws_region  = "us-east-1"
+environment = "prod"
+
+# Networking
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# Domain (leave empty to skip DNS/TLS setup initially)
+domain_name         = ""        # e.g. "forensicflight.io"
+api_subdomain       = "api"
+acm_certificate_arn = ""        # required if domain_name is set
+
+# Instance sizing (MVP — upgrade when traffic warrants)
+rds_instance_class        = "db.t3.small"
+rds_allocated_storage_gb  = 20
+redis_node_type           = "cache.t3.micro"
+api_cpu                   = 512
+api_memory                = 1024
+worker_parse_cpu          = 1024
+worker_parse_memory       = 2048
+worker_investigate_cpu    = 1024
+worker_investigate_memory = 2048
+qdrant_cpu                = 512
+qdrant_memory             = 1024
+
+# Alerts
+alert_email = "your-team@example.com"
+
+# Secrets — DO NOT put actual values here.
+# Set via environment variables instead:
+#   export TF_VAR_db_password="$(openssl rand -base64 32)"
+#   export TF_VAR_api_secret_key="$(openssl rand -base64 32)"
+#   export TF_VAR_anthropic_api_key="sk-ant-..."
+#   export TF_VAR_openai_api_key="sk-..."
