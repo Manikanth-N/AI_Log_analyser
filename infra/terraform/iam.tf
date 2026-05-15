@@ -28,8 +28,8 @@ resource "aws_iam_role_policy" "ecs_execution_secrets" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["secretsmanager:GetSecretValue"]
+      Effect = "Allow"
+      Action = ["secretsmanager:GetSecretValue"]
       Resource = [
         aws_secretsmanager_secret.anthropic_api_key.arn,
         aws_secretsmanager_secret.openai_api_key.arn,
@@ -65,8 +65,8 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
         Resource = [
           aws_s3_bucket.data.arn,
           "${aws_s3_bucket.data.arn}/*",
@@ -83,8 +83,8 @@ resource "aws_iam_role_policy" "ecs_task_cloudwatch" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = [
+      Effect = "Allow"
+      Action = [
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
         "logs:PutLogEvents",
@@ -103,8 +103,8 @@ resource "aws_iam_role_policy" "ecs_task_exec" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = [
+      Effect = "Allow"
+      Action = [
         "ssmmessages:CreateControlChannel",
         "ssmmessages:CreateDataChannel",
         "ssmmessages:OpenControlChannel",
@@ -135,7 +135,9 @@ variable "github_repo" {
 }
 
 resource "aws_iam_role" "github_actions" {
-  name = "${local.name_prefix}-github-actions-role"
+  # Name matches the resource created by bootstrap.sh — no env prefix.
+  # Changing this forces replacement and breaks OIDC auth during the window.
+  name = "forensic-flight-github-actions"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -158,16 +160,16 @@ resource "aws_iam_role" "github_actions" {
 }
 
 resource "aws_iam_role_policy" "github_actions" {
-  name = "${local.name_prefix}-github-actions-policy"
+  name = "forensic-flight-deploy-policy"
   role = aws_iam_role.github_actions.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ECRAuth"
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken"]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = ["*"]
       },
       {
@@ -199,9 +201,9 @@ resource "aws_iam_role_policy" "github_actions" {
         Resource = ["*"]
       },
       {
-        Sid      = "PassExecutionRole"
-        Effect   = "Allow"
-        Action   = ["iam:PassRole"]
+        Sid    = "PassExecutionRole"
+        Effect = "Allow"
+        Action = ["iam:PassRole"]
         Resource = [
           aws_iam_role.ecs_execution.arn,
           aws_iam_role.ecs_task.arn,

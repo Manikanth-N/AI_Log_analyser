@@ -43,7 +43,7 @@ resource "aws_cloudwatch_metric_alarm" "api_response_time" {
   namespace           = "AWS/ApplicationELB"
   period              = 60
   extended_statistic  = "p95"
-  threshold           = 30   # 30s p95 — LLM calls are slow but this catches stuck tasks
+  threshold           = 30 # 30s p95 — LLM calls are slow but this catches stuck tasks
   alarm_description   = "API p95 response time exceeded 30s"
   treat_missing_data  = "notBreaching"
 
@@ -124,7 +124,7 @@ resource "aws_cloudwatch_metric_alarm" "rds_free_storage" {
   namespace           = "AWS/RDS"
   period              = 300
   statistic           = "Average"
-  threshold           = 5368709120  # 5 GB in bytes
+  threshold           = 5368709120 # 5 GB in bytes
   alarm_description   = "RDS free storage below 5 GB"
   treat_missing_data  = "breaching"
 
@@ -166,8 +166,11 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title  = "API — Request Rate & Errors"
+          title  = "API - Request Rate and Errors"
+          region = var.aws_region
           period = 60
+          stat   = "Sum"
+          view   = "timeSeries"
           metrics = [
             ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.api.arn_suffix],
             ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", aws_lb.api.arn_suffix],
@@ -180,8 +183,11 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title  = "ECS — CPU Utilization"
+          title  = "ECS - CPU Utilization"
+          region = var.aws_region
           period = 60
+          stat   = "Average"
+          view   = "timeSeries"
           metrics = [
             ["AWS/ECS", "CPUUtilization", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.api.name],
             ["AWS/ECS", "CPUUtilization", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.worker_parse.name],

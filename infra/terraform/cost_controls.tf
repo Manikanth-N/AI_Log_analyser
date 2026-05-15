@@ -4,7 +4,7 @@
 
 variable "monthly_budget_usd" {
   type        = number
-  default     = 500  # alert at $500/mo; adjust to 2× your expected normal spend
+  default     = 500 # alert at $500/mo; adjust to 2× your expected normal spend
   description = "Monthly spend threshold in USD before alert fires."
 }
 
@@ -21,27 +21,27 @@ resource "aws_budgets_budget" "monthly" {
   }
 
   notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 80   # alert at 80% of budget
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "ACTUAL"
-    subscriber_sns_topic_arns  = [aws_sns_topic.alerts.arn]
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 80 # alert at 80% of budget
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.alerts.arn]
   }
 
   notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 100  # alert when budget is exceeded
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "ACTUAL"
-    subscriber_sns_topic_arns  = [aws_sns_topic.alerts.arn]
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 100 # alert when budget is exceeded
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.alerts.arn]
   }
 
   notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 100  # forecasted overrun alert
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "FORECASTED"
-    subscriber_sns_topic_arns  = [aws_sns_topic.alerts.arn]
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 100 # forecasted overrun alert
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "FORECASTED"
+    subscriber_sns_topic_arns = [aws_sns_topic.alerts.arn]
   }
 }
 
@@ -54,7 +54,7 @@ resource "aws_cloudwatch_metric_alarm" "investigation_queue_depth" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "ApproximateNumberOfMessagesNotVisible"
-  namespace           = "AWS/SQS"   # Uses Redis queue depth if published to CW
+  namespace           = "AWS/SQS" # Uses Redis queue depth if published to CW
   period              = 300
   statistic           = "Maximum"
   threshold           = 10
@@ -63,7 +63,7 @@ resource "aws_cloudwatch_metric_alarm" "investigation_queue_depth" {
 
   # Publish investigation queue depth as a custom metric from the worker
   # (requires a CloudWatch agent or custom metric publisher — see deploy/runbook.md)
-  dimensions = {}   # placeholder; replace with actual dimension when custom metric is set up
+  dimensions = {} # placeholder; replace with actual dimension when custom metric is set up
 
   alarm_actions = [aws_sns_topic.alerts.arn]
 }
@@ -80,7 +80,7 @@ resource "aws_cloudwatch_metric_alarm" "nat_bytes_high" {
   namespace           = "AWS/NATGateway"
   period              = 3600
   statistic           = "Sum"
-  threshold           = 1073741824  # 1 GB/hour — adjust to your expected API call volume
+  threshold           = 1073741824 # 1 GB/hour — adjust to your expected API call volume
   alarm_description   = "NAT Gateway outbound > 1GB/hour — possible runaway LLM API calls"
   treat_missing_data  = "notBreaching"
 
@@ -99,9 +99,9 @@ resource "aws_cloudwatch_metric_alarm" "s3_data_bucket_size" {
   evaluation_periods  = 1
   metric_name         = "BucketSizeBytes"
   namespace           = "AWS/S3"
-  period              = 86400   # daily metric (S3 reports once per day)
+  period              = 86400 # daily metric (S3 reports once per day)
   statistic           = "Average"
-  threshold           = 107374182400  # 100 GB
+  threshold           = 107374182400 # 100 GB
   alarm_description   = "Data bucket exceeded 100 GB — review log retention policy"
   treat_missing_data  = "notBreaching"
 

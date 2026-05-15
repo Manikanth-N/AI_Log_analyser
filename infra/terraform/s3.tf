@@ -58,7 +58,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "data" {
 
 resource "aws_s3_bucket" "frontend" {
   bucket        = "${local.name_prefix}-frontend-${local.suffix}"
-  force_destroy = true  # fine for static assets — redeployed on every push
+  force_destroy = true # fine for static assets — redeployed on every push
   tags          = { Name = "${local.name_prefix}-frontend" }
 }
 

@@ -68,27 +68,27 @@ variable "redis_node_type" {
 
 variable "api_cpu" {
   type    = number
-  default = 512   # 0.5 vCPU
+  default = 512 # 0.5 vCPU
 }
 
 variable "api_memory" {
   type    = number
-  default = 1024  # 1 GB
+  default = 1024 # 1 GB
 }
 
 variable "worker_parse_cpu" {
   type    = number
-  default = 2048  # 2 vCPU — pymavlink 6GB BIN parsing is CPU-bound (~2min/file)
+  default = 2048 # 2 vCPU — pymavlink 6GB BIN parsing is CPU-bound (~2min/file)
 }
 
 variable "worker_parse_memory" {
   type    = number
-  default = 4096  # 4 GB — large BIN files decompress to ~4× in memory
+  default = 4096 # 4 GB — large BIN files decompress to ~4× in memory
 }
 
 variable "worker_investigate_cpu" {
   type    = number
-  default = 1024  # 1 vCPU — LLM pipeline (single-threaded)
+  default = 1024 # 1 vCPU — LLM pipeline (single-threaded)
 }
 
 variable "worker_investigate_memory" {

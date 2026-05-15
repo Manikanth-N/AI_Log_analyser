@@ -379,12 +379,17 @@ def health_detailed():
     import redis as _redis
     checks: dict[str, str] = {}
 
-    # Database
+    # Database — probe with a valid UUID that won't exist; NotFound is expected and OK.
     try:
-        db.get_flight("health-probe-nonexistent")
+        db.get_flight("00000000-0000-0000-0000-000000000000")
         checks["database"] = "ok"
     except Exception as e:
-        checks["database"] = f"error: {e}"
+        err = str(e)
+        # "not found" / "no result" = DB is reachable, probe flight just doesn't exist
+        if any(kw in err.lower() for kw in ("not found", "no result", "none")):
+            checks["database"] = "ok"
+        else:
+            checks["database"] = f"error: {err}"
 
     # Redis
     try:

@@ -8,11 +8,8 @@ resource "aws_lb" "api" {
   enable_deletion_protection = true
   enable_http2               = true
 
-  access_logs {
-    bucket  = aws_s3_bucket.data.id
-    prefix  = "alb-logs"
-    enabled = true
-  }
+  # access_logs disabled: data bucket uses SSE-KMS, incompatible with ALB log writes.
+  # Add a dedicated SSE-S3 log bucket post-MVP if access logs are needed.
 
   tags = { Name = "${local.name_prefix}-alb" }
 }
@@ -34,13 +31,14 @@ resource "aws_lb_target_group" "api" {
     matcher             = "200"
   }
 
-  deregistration_delay = 30  # drain quickly for Fargate rolling deploys
+  deregistration_delay = 30 # drain quickly for Fargate rolling deploys
 
   tags = { Name = "${local.name_prefix}-api-tg" }
 }
 
-# HTTP listener — redirects to HTTPS
+# HTTP listener — redirects to HTTPS (only when ACM cert is present; otherwise http_direct handles port 80)
 resource "aws_lb_listener" "http" {
+  count             = var.acm_certificate_arn != "" ? 1 : 0
   load_balancer_arn = aws_lb.api.arn
   port              = 80
   protocol          = "HTTP"

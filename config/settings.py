@@ -20,10 +20,15 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://forensic:forensic@localhost:5432/forensic_flight"
     database_url_sync: str = "postgresql+psycopg2://forensic:forensic@localhost:5432/forensic_flight"
 
-    # Redis
+    # Redis — redis-py direct connections (ssl_cert_reqs=none is redis-py lowercase format)
     redis_url: str = "redis://localhost:6379/0"
     redis_result_url: str = "redis://localhost:6379/1"
     redis_pubsub_url: str = "redis://localhost:6379/2"
+
+    # Celery broker/backend URLs — kombu requires uppercase CERT_NONE format.
+    # Set these in ECS env for workers; fall back to redis_url locally (non-TLS).
+    celery_broker_url: str = ""
+    celery_result_url: str = ""
 
     # Qdrant
     qdrant_url: str = "http://localhost:6333"

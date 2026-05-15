@@ -3,7 +3,7 @@ resource "aws_cloudfront_distribution" "frontend" {
   is_ipv6_enabled     = true
   default_root_object = "index.html"
   comment             = "${local.name_prefix} SPA"
-  price_class         = "PriceClass_100"  # US + EU only — cheapest tier
+  price_class         = "PriceClass_100" # US + EU only — cheapest tier
 
   aliases = var.domain_name != "" ? ["${var.domain_name}", "www.${var.domain_name}"] : []
 
@@ -28,8 +28,8 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
 
     min_ttl     = 0
-    default_ttl = 86400     # 1 day for index.html (overridden by S3 object headers)
-    max_ttl     = 31536000  # 1 year for hashed assets
+    default_ttl = 86400    # 1 day for index.html (overridden by S3 object headers)
+    max_ttl     = 31536000 # 1 year for hashed assets
   }
 
   # SPA 404/403 → index.html (client-side routing)

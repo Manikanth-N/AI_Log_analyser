@@ -6,7 +6,7 @@ resource "aws_elasticache_subnet_group" "main" {
 
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id = "${local.name_prefix}-redis"
-  description          = "Forensic Flight Redis — Celery broker + pubsub"
+  description          = "Forensic Flight Redis - Celery broker + pubsub"
 
   node_type            = var.redis_node_type
   port                 = 6379
@@ -40,7 +40,7 @@ resource "aws_elasticache_replication_group" "redis" {
 # Redis AUTH token — generated once, stored in Secrets Manager
 resource "random_password" "redis_auth" {
   length  = 32
-  special = false  # Redis auth tokens: alphanumeric only
+  special = false # Redis auth tokens: alphanumeric only
 }
 
 resource "aws_secretsmanager_secret" "redis_auth" {

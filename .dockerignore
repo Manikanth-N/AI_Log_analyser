@@ -1,0 +1,48 @@
+# Secrets and infra — never ship into image
+infra/
+.env
+.env.*
+*.tfvars
+*.tfstate
+*.tfstate.backup
+
+# Version control
+.git/
+.github/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Frontend (not needed in API/worker images)
+frontend/
+
+# Test data
+tests/
+*.BIN
+logs/
+
+# Local dev files
+docker-compose.yml
+docker-compose.prod.yml
+docker/
+.dockerignore
+Makefile
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo

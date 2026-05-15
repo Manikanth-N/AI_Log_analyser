@@ -1,6 +1,20 @@
 logs/
 *.BIN
-logs/
-*.BIN
-logs/
-*.BIN
+
+# Terraform — never commit state or secrets
+infra/terraform/terraform.tfvars
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/.terraform/
+# .terraform.lock.hcl IS committed — pins provider versions for reproducible builds
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+!.env.example

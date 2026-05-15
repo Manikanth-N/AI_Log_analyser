@@ -8,8 +8,8 @@ logger = get_task_logger(__name__)
 
 celery_app = Celery(
     "forensic_flight",
-    broker=settings.redis_url,
-    backend=settings.redis_result_url,
+    broker=settings.celery_broker_url or settings.redis_url,
+    backend=settings.celery_result_url or settings.redis_result_url,
     include=["api.workers.tasks"],
 )
 

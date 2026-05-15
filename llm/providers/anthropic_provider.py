@@ -74,11 +74,12 @@ class AnthropicProvider:
         system: str | None = None,
         temperature: float = 0.1,
         max_retries: int = 3,
+        max_tokens: int = 8192,
     ) -> T:
         try:
             response, completion = self._instructor.messages.create_with_completion(
                 model=model,
-                max_tokens=8192,
+                max_tokens=max_tokens,
                 system=system or "",
                 messages=messages,
                 response_model=response_model,

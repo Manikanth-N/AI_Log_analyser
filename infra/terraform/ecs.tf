@@ -56,37 +56,66 @@ resource "aws_efs_file_system" "qdrant" {
 }
 
 resource "aws_efs_mount_target" "qdrant" {
-  count           = length(aws_subnet.private)
+  count           = length(var.availability_zones)
   file_system_id  = aws_efs_file_system.qdrant.id
   subnet_id       = aws_subnet.private[count.index].id
   security_groups = [aws_security_group.efs.id]
 }
 
+# ── EFS for shared app storage (raw uploads + Parquet) ───────────────────────
+# API and workers share a single EFS so uploaded files are visible to parse workers.
+
+resource "aws_efs_file_system" "app_storage" {
+  creation_token   = "${local.name_prefix}-app-storage"
+  encrypted        = true
+  performance_mode = "generalPurpose"
+  throughput_mode  = "bursting"
+
+  tags = { Name = "${local.name_prefix}-app-efs" }
+}
+
+resource "aws_efs_mount_target" "app_storage" {
+  count           = length(var.availability_zones)
+  file_system_id  = aws_efs_file_system.app_storage.id
+  subnet_id       = aws_subnet.private[count.index].id
+  security_groups = [aws_security_group.app_efs.id]
+}
+
+resource "aws_efs_access_point" "app_storage" {
+  file_system_id = aws_efs_file_system.app_storage.id
+
+  root_directory {
+    path = "/storage"
+    creation_info {
+      owner_uid   = 0
+      owner_gid   = 0
+      permissions = "0777"
+    }
+  }
+
+  tags = { Name = "${local.name_prefix}-app-storage-ap" }
+}
+
 # ── Common environment config (shared by API + workers) ───────────────────────
 
 locals {
-  redis_url = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0"
+  redis_url = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=none"
 
   common_environment = [
-    { name = "STORAGE_ROOT",                   value = "/data" },
-    { name = "INFERENCE_MODE",                 value = "api" },
-    { name = "DOMAIN_PROVIDER",                value = "openai" },
-    { name = "DOMAIN_MODEL",                   value = "gpt-4o-mini-2024-07-18" },
-    { name = "CRITICAL_PROVIDER",              value = "anthropic" },
-    { name = "CRITICAL_MODEL",                 value = "claude-sonnet-4-6" },
-    { name = "FALLBACK_PROVIDER",              value = "openai" },
-    { name = "FALLBACK_MODEL",                 value = "gpt-4o-2024-11-20" },
-    { name = "EMBEDDING_PROVIDER",             value = "openai" },
-    { name = "OPENAI_EMBEDDING_MODEL",         value = "text-embedding-3-small" },
+    { name = "STORAGE_ROOT", value = "/tmp/storage" },
+    { name = "INFERENCE_MODE", value = "api" },
+    { name = "DOMAIN_PROVIDER", value = "openai" },
+    { name = "DOMAIN_MODEL", value = "gpt-4o-mini-2024-07-18" },
+    { name = "CRITICAL_PROVIDER", value = "anthropic" },
+    { name = "CRITICAL_MODEL", value = "claude-sonnet-4-6" },
+    { name = "FALLBACK_PROVIDER", value = "openai" },
+    { name = "FALLBACK_MODEL", value = "gpt-4o-2024-11-20" },
+    { name = "EMBEDDING_PROVIDER", value = "openai" },
+    { name = "OPENAI_EMBEDDING_MODEL", value = "text-embedding-3-small" },
     { name = "INFERENCE_REQUEST_TIMEOUT_SECONDS", value = "120" },
-    { name = "QDRANT_URL",                     value = "http://qdrant.forensic-flight.internal:6333" },
+    { name = "QDRANT_URL", value = "http://qdrant:6333" },
   ]
 
-  common_secrets = [
-    { name = "ANTHROPIC_API_KEY", valueFrom = aws_secretsmanager_secret.anthropic_api_key.arn },
-    { name = "OPENAI_API_KEY",    valueFrom = aws_secretsmanager_secret.openai_api_key.arn },
-    { name = "SECRET_KEY",        valueFrom = aws_secretsmanager_secret.api_secret_key.arn },
-  ]
 }
 
 # ── Qdrant Task Definition ────────────────────────────────────────────────────
@@ -139,13 +168,6 @@ resource "aws_ecs_task_definition" "qdrant" {
       }
     }
 
-    healthCheck = {
-      command     = ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
-      interval    = 30
-      timeout     = 10
-      retries     = 3
-      startPeriod = 30
-    }
   }])
 }
 
@@ -177,7 +199,7 @@ resource "aws_ecs_service" "qdrant" {
     }
   }
 
-  deployment_minimum_healthy_percent = 0   # allow full replacement (single task)
+  deployment_minimum_healthy_percent = 0 # allow full replacement (single task)
   deployment_maximum_percent         = 100
 
   depends_on = [aws_efs_mount_target.qdrant]
@@ -200,6 +222,18 @@ resource "aws_ecs_task_definition" "api" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  volume {
+    name = "app-storage"
+    efs_volume_configuration {
+      file_system_id          = aws_efs_file_system.app_storage.id
+      transit_encryption      = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.app_storage.id
+        iam             = "DISABLED"
+      }
+    }
+  }
+
   container_definitions = jsonencode([{
     name      = "api"
     image     = local.api_image
@@ -211,13 +245,19 @@ resource "aws_ecs_task_definition" "api" {
       protocol      = "tcp"
     }]
 
+    mountPoints = [{
+      sourceVolume  = "app-storage"
+      containerPath = "/tmp/storage"
+      readOnly      = false
+    }]
+
     environment = concat(local.common_environment, [
-      { name = "DATABASE_URL",      value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
+      { name = "DATABASE_URL", value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
       { name = "DATABASE_URL_SYNC", value = "postgresql+psycopg2://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
-      { name = "REDIS_URL",         value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0" },
-      { name = "REDIS_RESULT_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1" },
-      { name = "REDIS_PUBSUB_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2" },
-      { name = "CORS_ORIGINS",      value = "[\"https://${var.domain_name}\", \"https://${aws_cloudfront_distribution.frontend.domain_name}\"]" },
+      { name = "REDIS_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=none" },
+      { name = "REDIS_RESULT_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1?ssl_cert_reqs=none" },
+      { name = "REDIS_PUBSUB_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2?ssl_cert_reqs=none" },
+      { name = "CORS_ORIGINS", value = "[\"https://${var.domain_name}\", \"https://${aws_cloudfront_distribution.frontend.domain_name}\"]" },
     ])
 
     secrets = local.common_secrets
@@ -248,7 +288,7 @@ resource "aws_ecs_service" "api" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
-  enable_execute_command = true  # allows `aws ecs execute-command` debug shell
+  enable_execute_command = true # allows `aws ecs execute-command` debug shell
 
   network_configuration {
     subnets          = aws_subnet.private[*].id
@@ -276,8 +316,10 @@ resource "aws_ecs_service" "api" {
   }
 
   depends_on = [
-    aws_lb_listener.http,
+    aws_lb_listener.http,        # redirect 80→443 (when ACM cert provided)
+    aws_lb_listener.http_direct, # forward 80→API  (when no cert)
     aws_ecs_service.qdrant,
+    aws_efs_mount_target.app_storage,
   ]
 
   tags = { Name = "${local.name_prefix}-api" }
@@ -298,6 +340,18 @@ resource "aws_ecs_task_definition" "worker_parse" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  volume {
+    name = "app-storage"
+    efs_volume_configuration {
+      file_system_id          = aws_efs_file_system.app_storage.id
+      transit_encryption      = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.app_storage.id
+        iam             = "DISABLED"
+      }
+    }
+  }
+
   container_definitions = jsonencode([{
     name      = "worker-parse"
     image     = local.worker_image
@@ -309,12 +363,20 @@ resource "aws_ecs_task_definition" "worker_parse" {
       "--without-gossip", "--without-mingle",
     ]
 
+    mountPoints = [{
+      sourceVolume  = "app-storage"
+      containerPath = "/tmp/storage"
+      readOnly      = false
+    }]
+
     environment = concat(local.common_environment, [
-      { name = "DATABASE_URL",      value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
+      { name = "DATABASE_URL", value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
       { name = "DATABASE_URL_SYNC", value = "postgresql+psycopg2://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
-      { name = "REDIS_URL",         value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0" },
-      { name = "REDIS_RESULT_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1" },
-      { name = "REDIS_PUBSUB_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2" },
+      { name = "REDIS_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=none" },
+      { name = "REDIS_RESULT_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1?ssl_cert_reqs=none" },
+      { name = "REDIS_PUBSUB_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2?ssl_cert_reqs=none" },
+      { name = "CELERY_BROKER_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=CERT_NONE" },
+      { name = "CELERY_RESULT_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1?ssl_cert_reqs=CERT_NONE" },
     ])
 
     secrets = local.common_secrets
@@ -355,6 +417,8 @@ resource "aws_ecs_service" "worker_parse" {
     rollback = true
   }
 
+  depends_on = [aws_efs_mount_target.app_storage]
+
   tags = { Name = "${local.name_prefix}-worker-parse" }
 
   lifecycle {
@@ -373,6 +437,18 @@ resource "aws_ecs_task_definition" "worker_investigate" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  volume {
+    name = "app-storage"
+    efs_volume_configuration {
+      file_system_id          = aws_efs_file_system.app_storage.id
+      transit_encryption      = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.app_storage.id
+        iam             = "DISABLED"
+      }
+    }
+  }
+
   container_definitions = jsonencode([{
     name      = "worker-investigate"
     image     = local.worker_image
@@ -384,12 +460,20 @@ resource "aws_ecs_task_definition" "worker_investigate" {
       "--without-gossip", "--without-mingle",
     ]
 
+    mountPoints = [{
+      sourceVolume  = "app-storage"
+      containerPath = "/tmp/storage"
+      readOnly      = false
+    }]
+
     environment = concat(local.common_environment, [
-      { name = "DATABASE_URL",      value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
+      { name = "DATABASE_URL", value = "postgresql+asyncpg://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
       { name = "DATABASE_URL_SYNC", value = "postgresql+psycopg2://forensic:${var.db_password}@${aws_db_instance.main.address}:5432/forensic_flight" },
-      { name = "REDIS_URL",         value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0" },
-      { name = "REDIS_RESULT_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1" },
-      { name = "REDIS_PUBSUB_URL",  value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2" },
+      { name = "REDIS_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=none" },
+      { name = "REDIS_RESULT_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1?ssl_cert_reqs=none" },
+      { name = "REDIS_PUBSUB_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/2?ssl_cert_reqs=none" },
+      { name = "CELERY_BROKER_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=CERT_NONE" },
+      { name = "CELERY_RESULT_URL", value = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/1?ssl_cert_reqs=CERT_NONE" },
     ])
 
     secrets = local.common_secrets
@@ -429,6 +513,8 @@ resource "aws_ecs_service" "worker_investigate" {
     enable   = true
     rollback = true
   }
+
+  depends_on = [aws_efs_mount_target.app_storage]
 
   tags = { Name = "${local.name_prefix}-worker-investigate" }
 

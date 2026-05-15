@@ -62,7 +62,7 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  count          = length(aws_subnet.public)
+  count          = length(var.availability_zones)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
@@ -77,7 +77,7 @@ resource "aws_route_table" "private" {
 }
 
 resource "aws_route_table_association" "private" {
-  count          = length(aws_subnet.private)
+  count          = length(var.availability_zones)
   subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private.id
 }
@@ -236,4 +236,26 @@ resource "aws_security_group" "efs" {
   }
 
   tags = { Name = "${local.name_prefix}-sg-efs" }
+}
+
+resource "aws_security_group" "app_efs" {
+  name        = "${local.name_prefix}-sg-app-efs"
+  description = "EFS: inbound NFS from API and worker tasks (shared app storage)"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${local.name_prefix}-sg-app-efs" }
 }
