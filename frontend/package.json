@@ -1,0 +1,33 @@
+{
+  "name": "forensic-flight-ui",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite --port 3000",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.28.0",
+    "ag-grid-community": "^31.2.0",
+    "ag-grid-react": "^31.2.0",
+    "axios": "^1.6.8",
+    "date-fns": "^3.6.0",
+    "maplibre-gl": "^4.1.0",
+    "plotly.js": "^2.29.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-plotly.js": "^2.6.0",
+    "react-router-dom": "^6.22.0",
+    "zustand": "^4.5.2"
+  },
+  "devDependencies": {
+    "@types/plotly.js": "^2.29.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/react-plotly.js": "^2.6.4",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.4.2",
+    "vite": "^5.2.0"
+  }
+}

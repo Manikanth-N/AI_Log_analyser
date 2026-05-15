@@ -1,0 +1,116 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: forensic
+      POSTGRES_PASSWORD: forensic
+      POSTGRES_DB: forensic_flight
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forensic"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://forensic:forensic@postgres:5432/forensic_flight
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://host.docker.internal:11434
+      STORAGE_ROOT: /data
+    volumes:
+      - ./:/app
+      - flight_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker-parse:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://forensic:forensic@postgres:5432/forensic_flight
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://host.docker.internal:11434
+      STORAGE_ROOT: /data
+    volumes:
+      - ./:/app
+      - flight_data:/data
+    depends_on:
+      - redis
+      - postgres
+    command: celery -A api.workers.celery_app worker --concurrency=2 -Q parse --loglevel=info
+
+  worker-investigate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://forensic:forensic@postgres:5432/forensic_flight
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://host.docker.internal:11434
+      STORAGE_ROOT: /data
+    volumes:
+      - ./:/app
+      - flight_data:/data
+    depends_on:
+      - redis
+      - postgres
+    command: celery -A api.workers.celery_app worker --concurrency=1 -Q investigate --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  flight_data:

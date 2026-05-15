@@ -1,0 +1,39 @@
+{
+  "profile_id": "ardupilot_quad",
+  "description": "ArduPilot quadcopter — typical DJI-class 450–550mm frame",
+  "autopilot": "ardupilot",
+  "vehicle_class": "multirotor",
+  "motor_count": 4,
+  "parameter_baselines": {
+    "EK3_CHECK_SCALE": {"expected": 1.0, "warning_delta": 0.3, "critical_delta": 0.5},
+    "GPS_HDOP_GOOD": {"expected": 2.5, "warning_delta": 1.0, "critical_delta": 2.0},
+    "BATT_LOW_VOLT": {"expected": 14.4, "warning_delta": 0.8, "critical_delta": 1.5},
+    "BATT_CRT_VOLT": {"expected": 13.8, "warning_delta": 0.8, "critical_delta": 1.5},
+    "FS_THR_ENABLE": {"expected": 1, "warning_delta": 0, "critical_delta": 0},
+    "INS_GYRO_FILTER": {"expected": 20.0, "warning_delta": 5.0, "critical_delta": 10.0},
+    "INS_ACCEL_FILTER": {"expected": 20.0, "warning_delta": 5.0, "critical_delta": 10.0},
+    "PILOT_SPEED_UP": {"expected": 250, "warning_delta": 100, "critical_delta": 200},
+    "WPNAV_SPEED": {"expected": 500, "warning_delta": 200, "critical_delta": 400},
+    "RTL_ALT": {"expected": 1500, "warning_delta": 500, "critical_delta": 1000}
+  },
+  "vibration_thresholds": {
+    "good_ms2": 5.0,
+    "acceptable_ms2": 15.0,
+    "warning_ms2": 30.0,
+    "critical_ms2": 60.0
+  },
+  "ekf_thresholds": {
+    "innovation_velocity_warning": 0.5,
+    "innovation_velocity_critical": 1.0,
+    "innovation_position_critical": 1.0,
+    "position_offset_warning_m": 3.0,
+    "position_offset_critical_m": 8.0
+  },
+  "power_thresholds": {
+    "cell_count_typical": 4,
+    "nominal_cell_voltage": 3.85,
+    "low_cell_voltage": 3.5,
+    "critical_cell_voltage": 3.3,
+    "max_internal_resistance_mohm": 80
+  }
+}

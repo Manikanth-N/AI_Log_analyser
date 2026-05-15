@@ -1,0 +1,39 @@
+{
+  "profile_id": "ardupilot_fixedwing",
+  "description": "ArduPilot fixed-wing — typical 1.4–2m span trainer/FPV",
+  "autopilot": "ardupilot",
+  "vehicle_class": "fixed_wing",
+  "motor_count": 1,
+  "parameter_baselines": {
+    "EK3_CHECK_SCALE": {"expected": 1.0, "warning_delta": 0.3, "critical_delta": 0.5},
+    "GPS_HDOP_GOOD": {"expected": 2.5, "warning_delta": 1.0, "critical_delta": 2.0},
+    "BATT_LOW_VOLT": {"expected": 10.5, "warning_delta": 0.5, "critical_delta": 1.0},
+    "BATT_CRT_VOLT": {"expected": 10.0, "warning_delta": 0.5, "critical_delta": 1.0},
+    "FS_THR_ENABLE": {"expected": 1, "warning_delta": 0, "critical_delta": 0},
+    "INS_GYRO_FILTER": {"expected": 20.0, "warning_delta": 5.0, "critical_delta": 10.0},
+    "INS_ACCEL_FILTER": {"expected": 20.0, "warning_delta": 5.0, "critical_delta": 10.0},
+    "STALL_PREVENTION": {"expected": 1, "warning_delta": 0, "critical_delta": 0},
+    "NAVL1_PERIOD": {"expected": 17.0, "warning_delta": 5.0, "critical_delta": 10.0},
+    "TECS_CLMB_MAX": {"expected": 5.0, "warning_delta": 2.0, "critical_delta": 4.0}
+  },
+  "vibration_thresholds": {
+    "good_ms2": 8.0,
+    "acceptable_ms2": 20.0,
+    "warning_ms2": 40.0,
+    "critical_ms2": 80.0
+  },
+  "ekf_thresholds": {
+    "innovation_velocity_warning": 0.5,
+    "innovation_velocity_critical": 1.0,
+    "innovation_position_critical": 1.0,
+    "position_offset_warning_m": 5.0,
+    "position_offset_critical_m": 15.0
+  },
+  "power_thresholds": {
+    "cell_count_typical": 3,
+    "nominal_cell_voltage": 3.85,
+    "low_cell_voltage": 3.5,
+    "critical_cell_voltage": 3.3,
+    "max_internal_resistance_mohm": 60
+  }
+}
