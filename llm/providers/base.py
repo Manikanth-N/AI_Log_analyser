@@ -86,7 +86,7 @@ class InferenceProvider(Protocol):
 
     @property
     def provider_id(self) -> str:
-        """Stable identifier: "anthropic" | "openai" | "vllm" | "bedrock" | "ollama"."""
+        """Stable identifier: "anthropic" | "openai" | "vllm" | "ollama"."""
         ...
 
     @property

@@ -1,5 +1,8 @@
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote as _url_quote
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,25 +15,33 @@ class InferenceMode(str, Enum):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Storage
-    storage_root: Path = Path.home() / ".forensic_flight"
-    max_upload_size_bytes: int = 6 * 1024 * 1024 * 1024  # 6GB
+    # ── Storage ───────────────────────────────────────────────────────────────
+    storage_root: Path = Path.home() / ".forensic_flight"   # local dev only
+    max_upload_size_bytes: int = 6 * 1024 * 1024 * 1024     # 6 GB
+    gcs_data_bucket: str = ""   # set to GCS bucket name to enable GCS mode
 
-    # Database
-    database_url: str = "postgresql+asyncpg://forensic:forensic@localhost:5432/forensic_flight"
-    database_url_sync: str = "postgresql+psycopg2://forensic:forensic@localhost:5432/forensic_flight"
+    # ── Database (prefer DATABASE_URL; fall back to component fields) ─────────
+    database_url: str = ""
+    database_url_sync: str = ""
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "forensic_flight"
+    db_user: str = "forensic_flight"
+    db_password: str = "forensic"
 
-    # Redis — redis-py direct connections (ssl_cert_reqs=none is redis-py lowercase format)
-    redis_url: str = "redis://localhost:6379/0"
-    redis_result_url: str = "redis://localhost:6379/1"
-    redis_pubsub_url: str = "redis://localhost:6379/2"
+    # ── Redis (prefer redis_url; fall back to component fields) ───────────────
+    redis_url: str = ""
+    redis_result_url: str = ""
+    redis_pubsub_url: str = ""
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_password: str = ""
 
-    # Celery broker/backend URLs — kombu requires uppercase CERT_NONE format.
-    # Set these in ECS env for workers; fall back to redis_url locally (non-TLS).
+    # Celery broker/backend — workers set these explicitly; API composes from redis_url.
     celery_broker_url: str = ""
     celery_result_url: str = ""
 
-    # Qdrant
+    # ── Qdrant ────────────────────────────────────────────────────────────────
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection_baselines: str = "baseline_flights"
     qdrant_collection_evidence: str = "investigation_evidence"
@@ -62,30 +73,28 @@ class Settings(BaseSettings):
     inference_mode: InferenceMode = InferenceMode.OLLAMA
 
     # Domain agents tier (EKF, GPS, Power, Vibration, Mission, etc.)
-    # Fast, cheap, high-volume calls.
-    domain_provider: str = "ollama"           # "openai" | "anthropic" | "vllm" | "ollama"
-    domain_model: str = ollama_fast_model     # default matches ollama fast_model
+    domain_provider: str = "ollama"
+    domain_model: str = "qwen3:8b-q4_K_M"
 
     # Critical-path tier (CrashInvestigator, ReportWriter)
-    # Best available reasoning quality — safety-critical output.
-    critical_provider: str = "ollama"         # "anthropic" | "openai" | "vllm" | "ollama"
-    critical_model: str = ollama_primary_model
+    critical_provider: str = "ollama"
+    critical_model: str = "qwen3:32b-q4_K_M"
 
-    # Fallback provider (fires when primary provider throws unrecoverable error)
-    fallback_provider: str = "ollama"         # "openai" | "anthropic" | "ollama"
-    fallback_model: str = ollama_primary_model
+    # Fallback provider
+    fallback_provider: str = "ollama"
+    fallback_model: str = "qwen3:32b-q4_K_M"
 
     # ── API keys (never hard-code; always via env / Secrets Manager) ──────────
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
     # ── Self-hosted vLLM endpoint ─────────────────────────────────────────────
-    vllm_endpoint: str = ""          # e.g. "http://vllm-internal:8000"
-    vllm_model: str = ""             # e.g. "meta-llama/Llama-3.3-70B-Instruct"
-    vllm_concurrency_limit: int = 4  # parallel requests to vLLM (tune to GPU memory)
+    vllm_endpoint: str = ""
+    vllm_model: str = ""
+    vllm_concurrency_limit: int = 4
 
     # ── Embedding provider ────────────────────────────────────────────────────
-    embedding_provider: str = "ollama"              # "openai" | "ollama"
+    embedding_provider: str = "ollama"
     openai_embedding_model: str = "text-embedding-3-small"
 
     # ── Request settings ──────────────────────────────────────────────────────
@@ -104,14 +113,43 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
-    enable_docs: bool = True  # set False in production to hide Swagger UI
+    enable_docs: bool = True
 
     # ── API key auth + rate limiting ──────────────────────────────────────────
-    # Comma-separated list of valid API keys (set via env var API_KEYS).
-    # Empty = auth disabled (development only — never deploy without keys).
     api_keys: str = ""
     rate_limit_investigations_per_day: int = 50
     rate_limit_uploads_per_hour: int = 100
+
+    @model_validator(mode="after")
+    def compose_connection_urls(self) -> "Settings":
+        # Database: compose from components when DATABASE_URL not explicitly set.
+        # Passwords must be percent-encoded — Secret Manager values often contain
+        # '/', '@', '#', '%' which break urlparse if embedded literally.
+        if not self.database_url:
+            user = _url_quote(self.db_user, safe="")
+            password = _url_quote(self.db_password, safe="")
+            base = f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+            self.database_url = base.replace("postgresql://", "postgresql+asyncpg://")
+            self.database_url_sync = base.replace("postgresql://", "postgresql+psycopg2://")
+        else:
+            # Normalize driver prefix on pre-set DATABASE_URL and derive missing sync URL.
+            url = self.database_url
+            if not url.startswith("postgresql+"):
+                self.database_url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            if not self.database_url_sync:
+                self.database_url_sync = self.database_url.replace(
+                    "postgresql+asyncpg://", "postgresql+psycopg2://", 1
+                )
+
+        # Redis: compose from components when redis_url not explicitly set.
+        if not self.redis_url:
+            auth = f":{_url_quote(self.redis_password, safe='')}@" if self.redis_password else ""
+            base = f"redis://{auth}{self.redis_host}:{self.redis_port}"
+            self.redis_url = f"{base}/0"
+            self.redis_result_url = f"{base}/1"
+            self.redis_pubsub_url = f"{base}/2"
+
+        return self
 
     @property
     def raw_storage(self) -> Path:
@@ -127,7 +165,6 @@ class Settings(BaseSettings):
 
     @property
     def using_managed_api(self) -> bool:
-        """True when at least one tier is routed to a managed API provider."""
         return self.inference_mode in (InferenceMode.API, InferenceMode.HYBRID) or (
             self.critical_provider in ("anthropic", "openai")
             or self.domain_provider in ("anthropic", "openai")

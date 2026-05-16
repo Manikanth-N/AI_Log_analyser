@@ -15,9 +15,9 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from api.middleware.auth import require_api_key, check_investigation_quota, check_upload_quota
-from api.middleware.upload_validation import validate_upload
+from api.middleware.upload_validation import validate_upload, validate_upload_init
 from config.settings import settings
-from storage.metadata_db import MetadataDB, create_tables
+from storage.metadata_db import MetadataDB
 from storage.parquet_store import ParquetStore
 
 log = structlog.get_logger(__name__)
@@ -26,7 +26,6 @@ app = FastAPI(
     title="Forensic Flight AI",
     version="1.0.0",
     description="Autonomous UAV flight log forensic investigator",
-    # Disable docs in production via env var to reduce attack surface
     docs_url="/docs" if getattr(settings, "enable_docs", True) else None,
     redoc_url=None,
 )
@@ -49,15 +48,119 @@ store = ParquetStore()
 
 @app.on_event("startup")
 async def startup():
-    create_tables()
-    settings.storage_root.mkdir(parents=True, exist_ok=True)
-    settings.raw_storage.mkdir(parents=True, exist_ok=True)
-    settings.flights_storage.mkdir(parents=True, exist_ok=True)
-    log.info("api_startup", storage_root=str(settings.storage_root))
+    # Schema is managed by Alembic — run `alembic upgrade head` before deploying.
+    # No create_all() here; Alembic is the sole schema authority.
+    if not settings.gcs_data_bucket:
+        # Local dev: ensure directories exist
+        settings.storage_root.mkdir(parents=True, exist_ok=True)
+        settings.raw_storage.mkdir(parents=True, exist_ok=True)
+        settings.flights_storage.mkdir(parents=True, exist_ok=True)
+    log.info("api_startup", gcs_mode=bool(settings.gcs_data_bucket))
 
 
 # ─────────────────────────────────────────────────────────────
-# FLIGHTS
+# CAPABILITIES
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/capabilities")
+def get_capabilities():
+    """Returns feature flags. Frontend uses upload_mode to select upload flow."""
+    return {
+        "upload_mode": "gcs" if settings.gcs_data_bucket else "direct",
+        "max_upload_size_bytes": settings.max_upload_size_bytes,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# FLIGHTS — upload (GCS signed-URL flow)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/flights/upload/init")
+async def init_upload(
+    body: dict,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Step 1 of GCS upload flow. Returns a resumable upload URL + flight_id.
+    The client uploads the file directly to upload_url (PUT), then calls /process.
+    """
+    if not settings.gcs_data_bucket:
+        raise HTTPException(501, "GCS upload not configured — use /upload instead")
+
+    filename = body.get("filename", "")
+    content_type = body.get("content_type", "application/octet-stream")
+    file_size = int(body.get("file_size", 0))
+
+    check_upload_quota(api_key)
+    safe_name = validate_upload_init(filename, file_size, settings.max_upload_size_bytes)
+
+    flight_id = str(uuid.uuid4())
+    gcs_path = f"raw/{flight_id}/{safe_name}"
+    gcs_uri = f"gs://{settings.gcs_data_bucket}/{gcs_path}"
+
+    # Create GCS resumable upload session
+    from google.cloud import storage as gcs_lib
+    gcs_client = gcs_lib.Client()
+    blob = gcs_client.bucket(settings.gcs_data_bucket).blob(gcs_path)
+    upload_url = blob.create_resumable_upload_session(
+        content_type=content_type,
+        size=file_size,
+    )
+
+    db.create_flight(
+        id=uuid.UUID(flight_id),
+        filename=safe_name,
+        file_size=file_size,
+        gcs_raw_uri=gcs_uri,
+        status="pending_upload",
+    )
+
+    log.info("upload_init", flight_id=flight_id, filename=safe_name, size=file_size)
+    return {"upload_url": str(upload_url), "flight_id": flight_id, "gcs_uri": gcs_uri}
+
+
+@app.post("/api/v1/flights/{flight_id}/process")
+async def process_flight(
+    flight_id: str,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Step 2 of GCS upload flow. Triggers parsing after client has uploaded to GCS.
+    """
+    flight = db.get_flight(flight_id)
+    if not flight:
+        raise HTTPException(404, "Flight not found")
+    if flight.status != "pending_upload":
+        raise HTTPException(409, f"Unexpected status: {flight.status}")
+
+    # Verify the blob actually landed in GCS before burning a parse queue slot.
+    # Catches silent client-side PUT failures (network drops, GCS rejections).
+    from google.cloud import storage as gcs_lib
+    gcs_uri = flight.gcs_raw_uri or ""
+    if gcs_uri.startswith("gs://"):
+        bucket_name, _, blob_name = gcs_uri[5:].partition("/")
+        gcs_client = gcs_lib.Client()
+        blob = gcs_client.bucket(bucket_name).blob(blob_name)
+        if not blob.exists():
+            raise HTTPException(
+                422,
+                "File not found in storage. Upload may have failed — please retry the upload.",
+            )
+
+    db.update_flight_status(flight_id, "uploaded")
+
+    from api.workers.tasks import parse_log_task
+    parse_log_task.apply_async(
+        args=[flight_id, gcs_uri],
+        queue="parse",
+    )
+
+    log.info("parse_queued", flight_id=flight_id, filename=flight.filename)
+    return {"flight_id": flight_id, "status": "parsing", "filename": flight.filename}
+
+
+# ─────────────────────────────────────────────────────────────
+# FLIGHTS — upload (direct flow for local dev)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/flights/upload")
@@ -66,13 +169,16 @@ async def upload_flight(
     api_key: str = Depends(require_api_key),
 ):
     """
-    Upload a UAV log file. Triggers background parsing.
+    Direct multipart upload for local development (no GCS_DATA_BUCKET set).
     Supports .BIN, .ULOG, .TLOG, .CSV, .JSON up to 6GB.
-    Requires X-API-Key header.
     """
-    check_upload_quota(api_key)
+    if settings.gcs_data_bucket:
+        raise HTTPException(
+            400,
+            "GCS mode active — use POST /api/v1/flights/upload/init instead",
+        )
 
-    # Validate extension, filename safety, magic bytes, and size
+    check_upload_quota(api_key)
     safe_name = await validate_upload(file, max_bytes=settings.max_upload_size_bytes)
 
     flight_id = str(uuid.uuid4())
@@ -80,27 +186,24 @@ async def upload_flight(
     upload_dir.mkdir(parents=True, exist_ok=True)
     dest_path = upload_dir / safe_name
 
-    # Stream write to disk (handles large files)
     sha256 = hashlib.sha256()
     file_size = 0
 
     async with aiofiles.open(dest_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):  # 1MB chunks
+        while chunk := await file.read(1024 * 1024):
             await f.write(chunk)
             sha256.update(chunk)
             file_size += len(chunk)
 
     file_hash = sha256.hexdigest()
 
-    # Check for duplicate
-    existing = db.get_flight_by_hash(file_hash) if hasattr(db, 'get_flight_by_hash') else None
+    existing = db.get_flight_by_hash(file_hash) if hasattr(db, "get_flight_by_hash") else None
     if existing:
         dest_path.unlink()
         upload_dir.rmdir()
         return JSONResponse({"flight_id": str(existing.id), "status": "existing", "duplicate": True})
 
-    # Create flight record
-    flight = db.create_flight(
+    db.create_flight(
         id=uuid.UUID(flight_id),
         sha256=file_hash,
         filename=safe_name,
@@ -109,7 +212,6 @@ async def upload_flight(
         status="uploaded",
     )
 
-    # Trigger background parse task
     from api.workers.tasks import parse_log_task
     parse_log_task.apply_async(
         args=[flight_id, str(dest_path)],
@@ -119,6 +221,10 @@ async def upload_flight(
     log.info("upload_complete", flight_id=flight_id, size=file_size, filename=safe_name)
     return {"flight_id": flight_id, "status": "parsing", "filename": safe_name}
 
+
+# ─────────────────────────────────────────────────────────────
+# FLIGHTS — read
+# ─────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/flights/{flight_id}")
 def get_flight(flight_id: str):
@@ -162,7 +268,6 @@ def get_phases(flight_id: str):
     phases = store.read_derived(flight_id, "phases")
     if phases is None:
         raise HTTPException(404, "Phases not yet computed")
-    # Normalise to {phases: [...]} regardless of whether stored as list or dict
     if isinstance(phases, list):
         phases = {"phases": phases}
     return phases
@@ -193,7 +298,7 @@ def get_anomalies(
 @app.get("/api/v1/telemetry/{flight_id}/series")
 def get_telemetry_series(
     flight_id: str,
-    channels: str,          # comma-separated "ATT.roll_deg,GPS.hdop"
+    channels: str,
     start_us: int | None = None,
     end_us: int | None = None,
     max_points: int = 2000,
@@ -206,7 +311,6 @@ def get_telemetry_series(
         end_us=end_us,
         max_points=max_points,
     )
-    # Convert {channel: {timestamps, values}} → [{channel, timestamps_us, values}]
     return [
         {"channel": ch, "timestamps_us": v["timestamps"], "values": v["values"]}
         for ch, v in raw.items()
@@ -236,7 +340,6 @@ def start_investigation(body: dict, api_key: str = Depends(require_api_key)):
     investigation = db.create_investigation(flight_id=flight_id, query=query)
     inv_id = str(investigation.id)
 
-    # Trigger investigation task
     from api.workers.tasks import run_investigation_task
     run_investigation_task.apply_async(
         args=[inv_id, flight_id, query],
@@ -316,11 +419,10 @@ async def follow_up_query(investigation_id: str, body: dict):
     from storage.parquet_store import ParquetStore
 
     flight_id = str(inv.flight_id)
-    store = ParquetStore()
+    _store = ParquetStore()
 
-    # Load context
-    timeline = store.read_derived(flight_id, "timeline") or {}
-    report = store.read_derived(flight_id, f"report_{investigation_id}") or {}
+    timeline = _store.read_derived(flight_id, "timeline") or {}
+    report = _store.read_derived(flight_id, f"report_{investigation_id}") or {}
 
     context = f"""
 Investigation findings:
@@ -365,33 +467,24 @@ def get_report(investigation_id: str, format: str = "json"):
 
 @app.get("/health")
 def health_simple():
-    """ALB health check — returns 200 if the process is alive."""
     return {"status": "ok"}
 
 
 @app.get("/api/v1/health")
 def health_detailed():
-    """
-    Detailed health — checks DB, Redis, and inference provider reachability.
-    Used by monitoring dashboards and manual ops verification.
-    Do NOT use this as the ALB health check (it's slow and might temporarily return degraded).
-    """
     import redis as _redis
     checks: dict[str, str] = {}
 
-    # Database — probe with a valid UUID that won't exist; NotFound is expected and OK.
     try:
         db.get_flight("00000000-0000-0000-0000-000000000000")
         checks["database"] = "ok"
     except Exception as e:
         err = str(e)
-        # "not found" / "no result" = DB is reachable, probe flight just doesn't exist
         if any(kw in err.lower() for kw in ("not found", "no result", "none")):
             checks["database"] = "ok"
         else:
             checks["database"] = f"error: {err}"
 
-    # Redis
     try:
         r = _redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2)
         r.ping()
@@ -399,7 +492,6 @@ def health_detailed():
     except Exception as e:
         checks["redis"] = f"error: {e}"
 
-    # Inference
     try:
         from llm.client import get_llm_client
         llm_ok = get_llm_client().check_health()

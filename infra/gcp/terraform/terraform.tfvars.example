@@ -1,0 +1,26 @@
+# terraform.tfvars.example — copy to terraform.tfvars and fill in values.
+# terraform.tfvars is listed in .gitignore — NEVER COMMIT.
+#
+# Secrets (db_password, redis_password, etc.) are NOT set here.
+# They are populated out-of-band via bootstrap.sh after first apply.
+# See: infra/gcp/terraform/bootstrap.sh
+
+project_id         = "your-gcp-project-id"
+region             = "us-central1"
+zone               = "us-central1-a"
+env                = "prod"
+github_repo        = "Manikanth-N/AI_Log_analyser"
+billing_account_id = "XXXXXX-XXXXXX-XXXXXX"
+alert_email        = "manikanth.nk1@gmail.com"
+monthly_budget_usd = 120
+
+# db_password: used ONLY for Cloud SQL user creation. Will appear in Terraform
+# state via google_sql_user.app.password (unavoidable). Generate with:
+#   openssl rand -base64 32 | tr -d '=+/' | head -c 40
+# Then also push to Secret Manager via bootstrap.sh.
+db_password = ""
+
+# Image tags — managed by CI/CD; set to "latest" for first apply
+api_image_tag      = "latest"
+frontend_image_tag = "latest"
+worker_image_tag   = "latest"

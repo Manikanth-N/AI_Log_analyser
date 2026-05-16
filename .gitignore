@@ -6,6 +6,10 @@ infra/terraform/terraform.tfvars
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
 infra/terraform/.terraform/
+infra/gcp/terraform/terraform.tfvars
+infra/gcp/terraform/*.tfstate
+infra/gcp/terraform/*.tfstate.backup
+infra/gcp/terraform/.terraform/
 # .terraform.lock.hcl IS committed — pins provider versions for reproducible builds
 
 # Python

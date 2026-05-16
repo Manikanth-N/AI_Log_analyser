@@ -1,9 +1,9 @@
 """Celery tasks for log parsing and investigation."""
 
 import uuid
-from pathlib import Path
 
 import structlog
+from celery.exceptions import SoftTimeLimitExceeded
 
 from .celery_app import celery_app
 
@@ -19,16 +19,16 @@ log = structlog.get_logger(__name__)
     default_retry_delay=30,
     # Hard limits set in celery_app.conf (task_soft_time_limit / task_time_limit)
 )
-def parse_log_task(self, flight_id: str, file_path: str):
+def parse_log_task(self, flight_id: str, gcs_uri: str):
     """
     Parse a raw log file and write Parquet + derived data.
-    Runs on the 'parse' queue with 2 concurrent workers.
+    Accepts a GCS URI ("gs://...") or local path for dev/test.
+    Runs on the 'parse' queue.
 
     Retries:
-      - Transient failures (OOM, file lock): retry up to 2× with 30s delay.
+      - Transient failures (OOM, network): retry up to 2× with 30s delay.
       - Permanent failures (corrupt file, unknown format): no retry — mark error.
     """
-    from config.settings import settings
     from pipeline.ingestion import IngestionPipeline
     from storage.metadata_db import MetadataDB
 
@@ -46,37 +46,48 @@ def parse_log_task(self, flight_id: str, file_path: str):
 
         pipeline = IngestionPipeline(
             flight_id=flight_id,
-            source_path=Path(file_path),
+            gcs_uri=gcs_uri,
             progress_cb=progress,
         )
         result = pipeline.run()
 
-        db.update_flight_status(
-            flight_id,
-            "ready",
+        updates: dict = dict(
             duration_s=result.metadata.duration_seconds,
             message_types=result.metadata.message_types,
             missing_critical=result.metadata.missing_critical,
             fw_version=result.metadata.firmware_version,
         )
+        if result.sha256:
+            updates["sha256"] = result.sha256
+
+        db.update_flight_status(flight_id, "ready", **updates)
 
         log.info("parse_complete", flight_id=flight_id, rows=result.rows_parsed)
         return {"flight_id": flight_id, "rows": result.rows_parsed, "status": "ready"}
 
+    except SoftTimeLimitExceeded:
+        log.error("parse_timeout", flight_id=flight_id, soft_limit_seconds=900)
+        db.update_flight_status(flight_id, "error")
+        _send_to_dlq("parse.dlq", {
+            "task": "parse_log_task",
+            "flight_id": flight_id,
+            "gcs_uri": gcs_uri,
+            "error": "soft_time_limit_exceeded",
+        })
+        raise
+
     except (MemoryError, OSError) as exc:
-        # Transient — retry
         log.warning("parse_transient_error", flight_id=flight_id, error=str(exc),
                     retries=self.request.retries)
         raise self.retry(exc=exc)
 
     except Exception as exc:
-        # Permanent — mark error, route to DLQ
         log.error("parse_permanent_error", flight_id=flight_id, error=str(exc))
         db.update_flight_status(flight_id, "error")
         _send_to_dlq("parse.dlq", {
             "task": "parse_log_task",
             "flight_id": flight_id,
-            "file_path": file_path,
+            "gcs_uri": gcs_uri,
             "error": str(exc),
         })
         raise
@@ -148,6 +159,26 @@ def run_investigation_task(self, investigation_id: str, flight_id: str, query: s
         log.info("investigation_complete", investigation_id=investigation_id,
                  classification=final_state.get("classification", "?"))
         return {"investigation_id": investigation_id, "status": "complete"}
+
+    except SoftTimeLimitExceeded:
+        log.error("investigation_timeout", investigation_id=investigation_id,
+                  soft_limit_seconds=900)
+        db.update_investigation(investigation_id, status="timeout")
+        _send_to_dlq("investigate.dlq", {
+            "task": "run_investigation_task",
+            "investigation_id": investigation_id,
+            "flight_id": flight_id,
+            "query": query,
+            "error": "soft_time_limit_exceeded",
+        })
+        try:
+            redis_client.publish(
+                f"inv:{investigation_id}",
+                '{"type": "error", "data": {"error": "investigation_timeout"}}',
+            )
+        except Exception:
+            pass
+        raise
 
     except Exception as exc:
         error_str = str(exc)

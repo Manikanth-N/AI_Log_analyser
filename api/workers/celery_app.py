@@ -64,7 +64,9 @@ celery_app.conf.update(
         },
     },
 
-    # Timeouts (hard kill after limit — tasks must not run forever)
-    task_soft_time_limit=3300,   # SIGTERM after 55 min → graceful shutdown
-    task_time_limit=3600,        # SIGKILL after 60 min → prevents zombie tasks
+    # Timeouts — investigations nominally complete in <90s; 429 retry storms can stretch
+    # to ~20 min. Soft limit sends SIGTERM so the task can clean up DB state.
+    # Hard limit sends SIGKILL as absolute backstop.
+    task_soft_time_limit=900,    # SIGTERM at 15 min → SoftTimeLimitExceeded raised
+    task_time_limit=1200,        # SIGKILL at 20 min → prevents zombie workers
 )

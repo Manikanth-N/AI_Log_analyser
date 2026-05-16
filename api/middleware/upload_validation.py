@@ -106,6 +106,26 @@ async def _check_magic_bytes(file: UploadFile, ext: str) -> bytes:
     return header
 
 
+def validate_upload_init(filename: str, file_size: int, max_bytes: int) -> str:
+    """
+    Validate upload metadata for the GCS signed-URL flow (no file body available yet).
+    Returns sanitised filename. Raises HTTPException on failure.
+    """
+    safe_name = _safe_filename(filename)
+    _check_extension(safe_name)
+    if file_size <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="file_size must be a positive integer.",
+        )
+    if file_size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size {file_size:,} bytes exceeds maximum {max_bytes:,} bytes.",
+        )
+    return safe_name
+
+
 async def validate_upload(file: UploadFile, max_bytes: int) -> str:
     """
     Full upload validation pipeline.

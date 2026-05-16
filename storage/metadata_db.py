@@ -25,7 +25,7 @@ class Flight(Base):
     __tablename__ = "flights"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    sha256 = Column(String(64), unique=True, nullable=False)
+    sha256 = Column(String(64), unique=True, nullable=True)   # null until worker computes it
     filename = Column(Text, nullable=False)
     file_size = Column(BigInteger)
     format = Column(String(32))           # ardupilot_bin, px4_ulog, etc.
@@ -36,11 +36,12 @@ class Flight(Base):
     flight_start_time = Column(DateTime, nullable=True)
     duration_s = Column(Float, nullable=True)
     status = Column(String(32), default="uploaded")
-    # uploaded | parsing | ready | error
+    # uploaded | pending_upload | parsing | ready | error
     message_types = Column(JSON, default=list)
     missing_critical = Column(JSON, default=list)
     parameter_count = Column(Integer, default=0)
-    raw_path = Column(Text, nullable=True)     # path to original file copy
+    raw_path = Column(Text, nullable=True)      # local path (local dev only)
+    gcs_raw_uri = Column(Text, nullable=True)   # gs://bucket/raw/{flight_id}/{filename}
 
     investigations = relationship("Investigation", back_populates="flight")
     anomalies = relationship("Anomaly", back_populates="flight")
@@ -152,8 +153,20 @@ class MetadataDB:
             return flight
 
     def get_flight(self, flight_id: str) -> Flight | None:
+        try:
+            fid = uuid.UUID(flight_id)
+        except ValueError:
+            return None
         with self.SessionLocal() as session:
-            return session.get(Flight, uuid.UUID(flight_id))
+            return session.get(Flight, fid)
+
+    def get_flight_by_hash(self, sha256: str) -> Flight | None:
+        with self.SessionLocal() as session:
+            return (
+                session.query(Flight)
+                .filter(Flight.sha256 == sha256)
+                .first()
+            )
 
     def update_flight_status(self, flight_id: str, status: str, **extra):
         with self.SessionLocal() as session:
@@ -185,8 +198,12 @@ class MetadataDB:
                 session.commit()
 
     def get_investigation(self, inv_id: str) -> Investigation | None:
+        try:
+            iid = uuid.UUID(inv_id)
+        except ValueError:
+            return None
         with self.SessionLocal() as session:
-            return session.get(Investigation, uuid.UUID(inv_id))
+            return session.get(Investigation, iid)
 
     def save_anomalies(self, flight_id: str, anomalies: list[dict]):
         with self.SessionLocal() as session:

@@ -8,10 +8,20 @@ Key API differences from OpenAI:
   - system prompt is a separate string parameter (not a "system" role message)
   - max_tokens is required (not optional)
   - usage: input_tokens / output_tokens (not prompt_tokens / completion_tokens)
+
+Haiku 4.5 compatibility note:
+  instructor's generate_anthropic_schema() passes model.model_json_schema() verbatim
+  as the tool input_schema.  Pydantic emits $defs/$ref when the same nested model is
+  referenced more than once (e.g. HypothesisRecord appears in both root_causes and
+  refuted_hypotheses).  Sonnet 4.6 silently resolves $ref; Haiku 4.5 strictly rejects
+  it with HTTP 400.  We patch generate_anthropic_schema at import time to inline all
+  $ref/$defs before the schema reaches the API.
 """
 
 from __future__ import annotations
 
+import copy
+import functools
 from typing import TypeVar
 
 import instructor
@@ -23,9 +33,71 @@ from .base import InferenceProvider, TokenUsage
 log = structlog.get_logger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
-# Sentinel so we can detect "no api key configured" at startup
 _NO_KEY = "__no_anthropic_key__"
 
+
+# ── $ref inliner ──────────────────────────────────────────────────────────────
+
+def _inline_refs(schema: dict) -> dict:
+    """
+    Recursively resolve all $ref references in a JSON schema and strip $defs.
+
+    Anthropic's tool input_schema validator (especially Haiku-class models)
+    rejects schemas containing $ref / $defs.  This transforms the Pydantic
+    output into a fully self-contained, flat schema.
+
+    Handles: arbitrary nesting, multiple references to the same definition.
+    Does NOT handle circular schemas (not produced by the Pydantic models in
+    this project, but would infinite-loop if present).
+    """
+    defs = schema.get("$defs", {})
+    if not defs:
+        return schema
+
+    def _resolve(node: object, defs: dict) -> object:
+        if isinstance(node, dict):
+            if "$ref" in node:
+                ref_name = node["$ref"].split("/")[-1]
+                return _resolve(copy.deepcopy(defs[ref_name]), defs)
+            return {k: _resolve(v, defs) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [_resolve(item, defs) for item in node]
+        return node
+
+    return _resolve(copy.deepcopy(schema), defs)  # type: ignore[return-value]
+
+
+# ── Patch instructor's Anthropic schema generator ─────────────────────────────
+# Must happen before any call to from_anthropic() or generate_anthropic_schema().
+
+try:
+    import instructor.processing.schema as _schema_mod
+
+    _orig_openai_schema = _schema_mod.generate_openai_schema.__wrapped__  # unwrap lru_cache
+
+    @functools.lru_cache(maxsize=256)
+    def _generate_anthropic_schema_inlined(model: type[BaseModel]) -> dict:
+        openai = _orig_openai_schema(model)
+        inlined = _inline_refs(model.model_json_schema())
+        return {
+            "name": openai["name"],
+            "description": openai["description"],
+            "input_schema": inlined,
+        }
+
+    _schema_mod.generate_anthropic_schema = _generate_anthropic_schema_inlined
+    # Clear any previously cached (wrong) entries
+    if hasattr(_schema_mod.generate_anthropic_schema, "cache_clear"):
+        _schema_mod.generate_anthropic_schema.cache_clear()
+
+    log.debug("anthropic_schema_patch_applied", detail="$ref inlining active for Haiku compatibility")
+
+except Exception as _patch_err:
+    log.warning("anthropic_schema_patch_failed", error=str(_patch_err),
+                detail="Haiku 4.5 may reject schemas with $ref; upgrade instructor if issues persist")
+
+
+# ── Provider class ─────────────────────────────────────────────────────────────
 
 class AnthropicProvider:
     """
@@ -40,7 +112,6 @@ class AnthropicProvider:
                 "AnthropicProvider: ANTHROPIC_API_KEY is not set. "
                 "Set the environment variable or configure anthropic_api_key in settings."
             )
-        # Import here so the package is optional — fails fast with a clear message
         try:
             from anthropic import Anthropic, APIError, APITimeoutError, RateLimitError
         except ImportError as exc:
@@ -100,8 +171,14 @@ class AnthropicProvider:
             )
             return response
         except (self._RateLimitError, self._APITimeoutError, self._APIError) as e:
-            log.error("anthropic_structured_error", model=model,
-                      schema=response_model.__name__, error=str(e))
+            log.error(
+                "anthropic_structured_error",
+                model=model,
+                schema=response_model.__name__,
+                error=str(e),
+                status_code=getattr(e, "status_code", None),
+                error_body=str(getattr(e, "body", None)),
+            )
             raise
 
     def complete(
@@ -127,7 +204,13 @@ class AnthropicProvider:
                 )
             return resp.content[0].text if resp.content else ""
         except (self._RateLimitError, self._APITimeoutError, self._APIError) as e:
-            log.error("anthropic_complete_error", model=model, error=str(e))
+            log.error(
+                "anthropic_complete_error",
+                model=model,
+                error=str(e),
+                status_code=getattr(e, "status_code", None),
+                error_body=str(getattr(e, "body", None)),
+            )
             raise
 
     def last_usage(self) -> TokenUsage:
